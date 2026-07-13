@@ -1,0 +1,50 @@
+namespace HeadTrackARKit {
+	/// <summary>
+	/// Persisted mod settings, registered with Kino.Config. All members use types from KSL's
+	/// natively supported list (bool/float/int/string) so no custom TypeParser is required.
+	/// </summary>
+	public interface IHeadTrackConfig {
+		/// <summary>Master on/off switch for applying the camera offset.</summary>
+		bool Enabled { get; set; }
+
+		/// <summary>UDP port to listen on for LOTA's OSC stream. Must match the port set in LOTA's Transmission Settings.</summary>
+		int OscPort { get; set; }
+
+		/// <summary>Multiplier applied to head translation (leaning) before it reaches the camera.</summary>
+		float PositionSensitivity { get; set; }
+
+		/// <summary>Multiplier applied to head rotation (looking around) before it reaches the camera.</summary>
+		float RotationSensitivity { get; set; }
+
+		/// <summary>0..1 smoothing factor for incoming position samples. Lower = smoother but laggier.</summary>
+		float PositionSmoothing { get; set; }
+
+		/// <summary>0..1 smoothing factor for incoming rotation samples. Lower = smoother but laggier.</summary>
+		float RotationSmoothing { get; set; }
+
+		/// <summary>Max translation offset, in meters, applied per axis after sensitivity scaling.</summary>
+		float MaxPositionOffset { get; set; }
+
+		/// <summary>Max rotation offset, in degrees, applied per euler axis after sensitivity scaling.</summary>
+		float MaxRotationOffset { get; set; }
+
+		// --- Zoom / FOV control ---
+
+		/// <summary>Degrees of FOV change per mouse scroll notch.</summary>
+		float ZoomSensitivity { get; set; }
+
+		/// <summary>How far the zoom offset can pull the FOV in (negative) or out (positive), in degrees.</summary>
+		float MaxZoomOffset { get; set; }
+
+		// --- Cockpit clipping guard ---
+
+		/// <summary>Master toggle. Off by default - needs the layer mask tuned against the real game first (see README).</summary>
+		bool ClippingGuardEnabled { get; set; }
+
+		/// <summary>Unity layer mask (as an int bitmask) the clipping raycast tests against.</summary>
+		int ClippingGuardLayerMask { get; set; }
+
+		/// <summary>Distance, in meters, kept between the camera and whatever the clipping raycast hits.</summary>
+		float ClippingGuardMargin { get; set; }
+	}
+}

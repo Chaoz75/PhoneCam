@@ -1,0 +1,25 @@
+Copy these files here before building (see README.md "Build" section):
+
+  UnityEngine.CoreModule.dll
+  UnityEngine.PhysicsModule.dll        (cockpit clipping guard's raycasts)
+  UnityEngine.InputLegacyModule.dll    (UnityEngine.Input - scroll wheel zoom)
+  Assembly-CSharp.dll                  (the game's own code - UIPhotoModeContext, used to
+                                         gate the "How to use" help panel to Photo Mode)
+
+    from: <CarX install>\Drift Racing Online_Data\Managed\
+    (verified folder name against a real install - it's "Drift Racing Online_Data",
+    not "CarXDriftRacingOnline_Data")
+
+  KSL.API.dll
+
+    from the official KSL SDK: https://github.com/trbflxr/ksl_sdk
+    (not found in Managed\ on the install checked, even with KSL already installed -
+    get a clean copy from the SDK rather than pulling from the loader's own kino.dll)
+
+These are game/loader files and are not included in this project.
+
+--- Confirmed working build (verified on a real build) ---
+Once all four DLLs above are in this folder, `dotnet build -c Release` from the project
+root succeeds with 0 warnings / 0 errors, producing bin\Release\net472\PhoneCam.dll, and
+(if tools\maykr.exe and the PhoneCam_maykr.kmc key are present) auto-signs a PhoneCam.ksm
+straight into <CarX install>\kino\mods\.
