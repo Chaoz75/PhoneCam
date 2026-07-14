@@ -88,7 +88,17 @@ namespace HeadTrackARKit.Tracking {
 				Mathf.Clamp(delta.z, -MaxPositionOffset, MaxPositionOffset));
 		}
 
-		/// <summary>Delta rotation relative to the calibrated baseline, sensitivity-scaled and clamped per euler axis.</summary>
+		/// <summary>
+		/// Delta rotation relative to the calibrated baseline, sensitivity-scaled. Pitch (x) and
+		/// yaw (y) are intentionally left unclamped as of 0.3.11 - MaxRotationOffsetDegrees no
+		/// longer applies to them at all - so physically turning your whole body all the way around
+		/// keeps rotating the camera continuously instead of stopping partway. This is safe:
+		/// Quaternion.Euler builds its rotation from sin/cos of the given angles, which are
+		/// periodic, so there's no discontinuity or error even as these values grow past +-180 (a
+		/// real 370-degree turn and a 10-degree turn produce the same, correct final orientation).
+		/// Roll (z) still clamps to MaxRotationOffsetDegrees - unlimited roll would let the camera
+		/// corkscrew, which nothing in a real head/body movement would naturally produce.
+		/// </summary>
 		public Quaternion GetRotationOffset() {
 			if (!isCalibrated_ || !hasSmoothedSample_) return Quaternion.identity;
 
@@ -96,10 +106,7 @@ namespace HeadTrackARKit.Tracking {
 
 			Vector3 euler = NormalizeEuler(delta.eulerAngles);
 			euler *= RotationSensitivity;
-			euler = new Vector3(
-				Mathf.Clamp(euler.x, -MaxRotationOffsetDegrees, MaxRotationOffsetDegrees),
-				Mathf.Clamp(euler.y, -MaxRotationOffsetDegrees, MaxRotationOffsetDegrees),
-				Mathf.Clamp(euler.z, -MaxRotationOffsetDegrees, MaxRotationOffsetDegrees));
+			euler.z = Mathf.Clamp(euler.z, -MaxRotationOffsetDegrees, MaxRotationOffsetDegrees);
 
 			return Quaternion.Euler(euler);
 		}

@@ -11,7 +11,6 @@ using KSL.API;
 using UnityEngine;
 using UnityEngine.Networking;
 using UnityEngine.Rendering;
-using UnityEngine.SceneManagement;
 
 namespace HeadTrackARKit {
 	/// <summary>
@@ -23,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.3.10", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.3.11", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.3.10";
+		private const string CurrentVersion = "0.3.11";
 
 		private const int DefaultOscPort = 9000;
 
@@ -263,35 +262,41 @@ namespace HeadTrackARKit {
 		}
 
 		/// <summary>
-		/// Searches every root GameObject in the active scene for anything whose name contains one
-		/// of GaugeNameKeywords, including inactive objects (a plain recursive Transform walk sees
-		/// inactive children too, unlike FindObjectsByType with the default "active only" mode).
-		/// Cheap enough to run every couple of seconds - it's a plain tree walk, not a per-frame cost.
+		/// Searches every GameObject currently loaded in memory (not just the "active" scene) for
+		/// anything whose name contains one of GaugeNameKeywords, including inactive objects.
+		///
+		/// The first attempt at this (0.3.10) walked SceneManager.GetActiveScene().GetRootGameObjects()
+		/// and found nothing, ever - confirmed by a real KSL log showing zero "Found N gauge
+		/// object(s)" lines across a full test session, even after MultiHUD itself logged finding
+		/// the speedometer at runtime. Root cause: MultiHUD's own log named the object's path
+		/// "KeepAlive(Clone)/UGUI/...", and CarX separately logs loading several scenes
+		/// "Additive" (nfs_studio, Race, vp_parking, etc.) - "KeepAlive(Clone)" is almost certainly
+		/// a DontDestroyOnLoad object, and DontDestroyOnLoad objects (along with anything in an
+		/// additively-loaded scene) are NOT returned by GetActiveScene().GetRootGameObjects(),
+		/// which only covers whichever single scene Unity currently considers "active." Switched to
+		/// Resources.FindObjectsOfTypeAll, which walks every loaded GameObject regardless of which
+		/// scene (or DontDestroyOnLoad) it lives in - filtered to go.scene.IsValid() so it only
+		/// matches real scene instances, not unrelated prefab/asset references that happen to be
+		/// loaded in memory.
 		/// </summary>
 		private void RefreshGaugeObjects() {
-			Scene scene = SceneManager.GetActiveScene();
-			foreach (GameObject root in scene.GetRootGameObjects()) {
-				CollectGaugeObjects(root.transform);
+			GameObject[] all = Resources.FindObjectsOfTypeAll<GameObject>();
+			foreach (GameObject go in all) {
+				if (!go.scene.IsValid()) continue;
+
+				string lower = go.name.ToLowerInvariant();
+				foreach (string keyword in GaugeNameKeywords) {
+					if (lower.Contains(keyword)) {
+						gaugeObjects_.Add(go);
+						break;
+					}
+				}
 			}
 
 			if (gaugeObjects_.Count > 0) {
 				var names = new List<string>();
 				foreach (GameObject go in gaugeObjects_) names.Add(go.name);
 				Kino.Log.Info($"[HeadTrackARKit] Found {gaugeObjects_.Count} gauge object(s): {string.Join(", ", names)}");
-			}
-		}
-
-		private void CollectGaugeObjects(Transform t) {
-			string lower = t.name.ToLowerInvariant();
-			foreach (string keyword in GaugeNameKeywords) {
-				if (lower.Contains(keyword)) {
-					gaugeObjects_.Add(t.gameObject);
-					break;
-				}
-			}
-
-			for (int i = 0; i < t.childCount; i++) {
-				CollectGaugeObjects(t.GetChild(i));
 			}
 		}
 
@@ -1053,8 +1058,11 @@ namespace HeadTrackARKit {
 				state_.MaxPositionOffset = maxPos;
 			}
 
+			// Pitch (up/down) and yaw (left/right) are unclamped as of 0.3.11 - full 360-degree
+			// turns keep going instead of stopping. This slider now only limits roll (tilting your
+			// head sideways).
 			float maxRot = config_.MaxRotationOffset;
-			if (Kino.UI.Slider(ref maxRot, 10f, 120f, $"Max rotation offset: {maxRot:F0} deg")) {
+			if (Kino.UI.Slider(ref maxRot, 10f, 120f, $"Max roll offset: {maxRot:F0} deg (pitch/yaw are unlimited)")) {
 				config_.MaxRotationOffset = maxRot;
 				state_.MaxRotationOffsetDegrees = maxRot;
 			}
@@ -1124,6 +1132,7 @@ namespace HeadTrackARKit {
 			Kino.UI.Label("Re-press F9 any time you shift position.");
 			Kino.UI.Label("Mouse wheel or +/- zooms the camera; F10 resets zoom.");
 			Kino.UI.Label("Leaning/walking moves the camera too - raise 'Max position offset' in Sensitivity/Safety clamps for bigger, room-scale movement.");
+			Kino.UI.Label("Looking/turning fully around (pitch and yaw) has no stopping point - only roll is limited by the safety clamp.");
 			Kino.UI.Label("Cockpit clipping guard (off by default) stops the camera short of the dashboard/seat when leaning in.");
 			Kino.UI.Label("Gauges hide automatically while PhoneCam is enabled (toggle in 'Gauge HUD workaround') since MultiHUD's speedometer reacts to every head movement/zoom otherwise.");
 

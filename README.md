@@ -9,6 +9,28 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.3.11** - Two fixes from testing 0.3.10 against a real KSL log:
+- **Gauge-hide workaround (0.3.10) never actually found anything to hide.** The log confirmed it:
+  zero "Found N gauge object(s)" lines across a full session, even after MultiHUD itself logged
+  finding its own speedometer at `KeepAlive(Clone)/UGUI/Root/Contexts/UIRaceFreerideMode/
+  UIRaceSpeedometer/Speedometer`. That `KeepAlive(Clone)` name is a strong tell it's a
+  `DontDestroyOnLoad` object, and the log also showed CarX loading several scenes "Additive"
+  (`nfs_studio`, `Race`, `vp_parking`) - neither DontDestroyOnLoad objects nor additively-loaded
+  scenes are covered by `SceneManager.GetActiveScene().GetRootGameObjects()`, which is what
+  0.3.10's search used, so it was structurally guaranteed to find nothing regardless of naming.
+  Switched to `Resources.FindObjectsOfTypeAll<GameObject>()` (filtered to `go.scene.IsValid()`),
+  which walks every loaded GameObject in every scene plus DontDestroyOnLoad in one pass. This is
+  also what was causing the reported gauge "flickering" when moving the camera - with nothing ever
+  found, the gauges were never actually hidden, just reacting to every camera change as before.
+- **Full 360-degree rotation - pitch and yaw are now unclamped.** `Max rotation offset` (previously
+  10-120 degrees) was clamping every euler axis, including pitch/yaw, which meant looking far
+  enough left/right or up/down would just stop rather than keep turning with you. Turning your
+  whole body around (not just your neck) should be able to spin the camera continuously with no
+  limit. Fixed in `HeadTrackState.GetRotationOffset()` by only clamping roll (tilting your head
+  sideways) - `Quaternion.Euler` builds rotations from periodic sin/cos, so leaving pitch/yaw
+  unclamped doesn't introduce any discontinuity or wrap-around glitch, even well past +-180
+  degrees. The safety-clamp slider is relabeled "Max roll offset" to match its new, narrower scope.
+
 **0.3.10** - Two changes based on the latest real-game feedback (a populated diagnostic log this
 time, plus explicit priority calls):
 - **Position tracking now supports room-scale, "walk around the car" movement, not just a small
@@ -441,17 +463,25 @@ libs/                       You put KSL.API.dll / UnityEngine.CoreModule.dll her
   not better. 0.3.8 writes to the real Transform/FOV again (keeping every such system in sync)
   while still separately rebuilding the view/projection matrices to guarantee Kino's Custom
   Camera mode can't ignore the change.
-- **Gauge HUD desync: closed as of 0.3.10, by hiding rather than fixing.** Two direct attempts
-  (0.3.7's decoupling, 0.3.8's revert-plus-matrix-override) didn't stop it, and it kept getting
-  re-reported across three real-game test rounds. Root cause is almost certainly unfixable from
-  this mod's side at all: MultiHUD's gauge Canvas is a separate mod's Screen-Space-Camera UI,
-  which is *designed* to read the real camera Transform/FOV every frame - any camera movement or
-  FOV change this mod makes (or any other mod/game system makes) will always be visible to it,
-  the same way it would be to any other Screen-Space-Camera UI in the scene. 0.3.10 sidesteps this
-  entirely: it finds the gauge object(s) by name at runtime and deactivates them outright while
-  PhoneCam is enabled, restoring them the instant it's turned off - see `HeadTrackMod.
-  RefreshGaugeObjects`/`SetGaugesHidden`. Trade-off: gauges aren't visible at all while tracking
-  is on, which is why it's a toggle (`HideGaugesWhileTracking`), not a forced behavior.
+- **Gauge HUD desync: the hide-instead-of-fix approach (0.3.10) was the right call, but its object
+  search was broken - fixed in 0.3.11.** MultiHUD's gauge Canvas is a separate mod's
+  Screen-Space-Camera UI, which is *designed* to read the real camera Transform/FOV every frame -
+  any camera movement or FOV change is always visible to it, the same way it would be to any other
+  Screen-Space-Camera UI in the scene, so hiding it outright rather than fighting the sync is still
+  the plan. But 0.3.10's search (`SceneManager.GetActiveScene().GetRootGameObjects()`) never found
+  the object at all - it's parented under what's almost certainly a `DontDestroyOnLoad` root
+  (`KeepAlive(Clone)`), and CarX also loads several scenes additively, neither of which that API
+  covers. 0.3.11 switches to `Resources.FindObjectsOfTypeAll<GameObject>()`, which finds it
+  regardless of which scene (or DontDestroyOnLoad) it lives in - see `HeadTrackMod.
+  RefreshGaugeObjects`/`SetGaugesHidden`. Trade-off unchanged: gauges aren't visible at all while
+  tracking is on, which is why it's a toggle (`HideGaugesWhileTracking`), not a forced behavior.
+- **Rotation was capped well short of a full turn - fixed in 0.3.11.** `MaxRotationOffsetDegrees`
+  was clamping pitch and yaw the same as roll (10-120 degree range), so looking far enough
+  left/right or up/down would just stop instead of continuing to turn with you - noticeable
+  specifically when physically turning your whole body around rather than just your neck.
+  `HeadTrackState.GetRotationOffset()` now only clamps roll; pitch/yaw are unclamped, and
+  `Quaternion.Euler`'s periodic sin/cos construction means that's safe - no discontinuity or
+  wrap-around glitch even well past +-180 degrees on either axis.
 - **Position tracking range: the "can't walk around" report was a clamp, not a broken pipeline.**
   `HeadTrackState.GetPositionOffset()` was already computing a correct, calibration-relative
   translation delta every frame - `Max position offset` (0.5m default, 1.5m slider ceiling) was

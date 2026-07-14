@@ -34,7 +34,12 @@ namespace HeadTrackARKit {
 		/// </summary>
 		bool PositionRangeUpgraded { get; set; }
 
-		/// <summary>Max rotation offset, in degrees, applied per euler axis after sensitivity scaling.</summary>
+		/// <summary>
+		/// Max roll offset, in degrees, applied after sensitivity scaling. As of 0.3.11 this only
+		/// clamps roll (tilting your head sideways) - pitch (up/down) and yaw (left/right) are left
+		/// unclamped so a full real-world 360-degree turn keeps rotating the camera continuously
+		/// instead of stopping partway. See HeadTrackState.GetRotationOffset.
+		/// </summary>
 		float MaxRotationOffset { get; set; }
 
 		// --- Zoom / FOV control ---
