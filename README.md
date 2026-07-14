@@ -9,6 +9,32 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.3.14** - Three changes:
+- **Removed the Gauge HUD workaround entirely** (the "Hide gauges while PhoneCam is enabled"
+  toggle and the "Log dashboard gauge diagnostics" button, plus all the supporting code and
+  config). It was solving the wrong problem in the first place (MultiHUD's 2D HUD, not the 3D
+  dashboard needles) and is no longer wanted in the menu.
+- **Added position-offset diagnostics**, mirroring the rotation ones already in place - a report
+  that stepping/leaning left-right in real life (translation, not looking around) wasn't visibly
+  moving the camera couldn't be confirmed either way from the existing log, since only rotation
+  was being logged. The periodic heartbeat now also prints the raw incoming position, the actual
+  per-axis offset `GetPositionOffset()` produced, and the current `MaxPositionOffset`/
+  `PositionSensitivity` - next test session's log will show directly whether position samples are
+  arriving and, if so, whether they're just being clamped down to nothing.
+- **0.3.13's actual build never made it into the game.** `dotnet build` (no `-c Release`) builds
+  the Debug configuration by default, and the `RunMaykr` step that signs and drops `PhoneCam.ksm`
+  into `kino\mods\` only runs `Condition="'$(Configuration)' == 'Release'"` - so the 0.3.12 `.ksm`
+  kept loading even after a "successful" build. Confirmed directly: the next KSL log still showed
+  `Loading [PhoneCam 0.3.12 ...]`, and with the swap-removal fix un-deployed, the same
+  `appliedOffsetEuler.x=180`-during-yaw-turn signature from before reappeared exactly as
+  predicted. No code changed here - just a reminder that `-c Release` is required for a real
+  build/deploy, not just `dotnet build`.
+
+Also requested this round, not yet implemented - needs design decisions first (see chat): an
+attach/detach toggle so the camera can decouple from the car entirely (car drives off on its own,
+camera free-floats from wherever it was and keeps taking head-tracking input) versus reattaching
+to follow the car again.
+
 **0.3.13** - The atan2 rewrite (0.3.12) fixed the axis-bleed bug, but real testing showed the camera
 could *still* flip upside down after a couple of full 360 turns. The 0.3.12 diagnostic log gave a
 direct, concrete answer: `appliedOffsetEuler` hit `x=234` (pitch) during ordinary left/right

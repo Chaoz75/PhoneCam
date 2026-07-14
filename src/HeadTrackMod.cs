@@ -22,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.3.13", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.3.14", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.3.13";
+		private const string CurrentVersion = "0.3.14";
 
 		private const int DefaultOscPort = 9000;
 
@@ -52,6 +52,16 @@ namespace HeadTrackARKit {
 		// offset actually applied to the camera.
 		private Vector3 lastRawArEuler_;
 		private Vector3 lastAppliedOffsetEuler_;
+
+		// 0.3.14: same idea as the two above, but for translation - added to help diagnose a
+		// report that stepping/leaning left-right in real life wasn't visibly moving the camera.
+		// Shows the raw incoming Unity-space position (post ArKitConversion, pre-calibration)
+		// alongside the actual per-axis offset GetPositionOffset() produced that frame, so a real
+		// log can confirm whether position samples are arriving at all and, if so, whether
+		// MaxPositionOffset/PositionSensitivity are clamping them down to nothing rather than the
+		// tracking itself being broken.
+		private Vector3 lastRawArPosition_;
+		private Vector3 lastAppliedPosOffset_;
 
 		private Camera cachedCamera_;
 		private float cameraCacheTime_;
@@ -100,36 +110,6 @@ namespace HeadTrackARKit {
 		// every frame (see Update()) so zoom feels smooth instead of snapping instantly.
 		private float zoomTargetDegrees_;
 		private float zoomCurrentDegrees_;
-
-		// --- MultiHUD gauge conflict workaround ---
-		// MultiHUD's gauge Canvas (confirmed "UGUI") reads the camera's real Transform/FOV
-		// directly - two direct fixes (0.3.8's revert-to-Transform + matrix override) never
-		// stopped it from visibly reacting to head movement/zoom, because that reaction is by
-		// design for a Screen-Space-Camera Canvas, not a bug in this mod's own camera handling.
-		// Rather than keep fighting a Canvas this mod doesn't own, these objects are located by
-		// name at runtime and simply deactivated while config_.Enabled is true, then reactivated
-		// the moment it's turned off - see UpdateGaugeVisibility.
-		private static readonly string[] GaugeNameKeywords = { "speedometer", "tachometer", "rpmgauge" };
-		private readonly List<GameObject> gaugeObjects_ = new List<GameObject>();
-		private bool gaugesHidden_;
-		private float lastGaugeSearchTime_;
-
-		// --- Dashboard gauge-needle diagnostics ---
-		// The hide-workaround above (found via GaugeNameKeywords) turned out to be solving a
-		// different problem than reported: those are MultiHUD's own 2D speedometer HUD objects,
-		// confirmed by MultiHUD's own log ("Found CarX speedometer at: .../UIRaceSpeedometer/
-		// Speedometer") - hiding them stopped THAT from reacting, but the actual complaint is the
-		// physical 3D dashboard gauge needles (visible in the cockpit) spinning/wobbling, only
-		// while PhoneCam is enabled - a completely different object this mod has no visibility
-		// into yet. Rather than guess at another keyword list blind, this is an on-demand scan
-		// (triggered by a button in the settings panel, so it can be run at the exact moment the
-		// wobble is visible) that casts a much wider net and logs each match's full hierarchy path
-		// plus whether a Camera component sits anywhere in its ancestor chain - the single most
-		// useful fact for telling apart "this needle is part of the car's interior model" from
-		// "this needle is parented under the camera rig," which would explain a lot.
-		private static readonly string[] DashboardDiagnosticKeywords = {
-			"speedo", "tach", "rpm", "gauge", "needle", "dash", "cluster", "odometer"
-		};
 
 		// --- In-game updater ---
 		// Checks GitHub Releases directly (not KSL's own updater, which only runs at game
@@ -224,8 +204,6 @@ namespace HeadTrackARKit {
 			float smoothing = Mathf.Clamp01(config_.ZoomSmoothing);
 			float rate = 1f - Mathf.Pow(1f - smoothing, Time.unscaledDeltaTime * 60f);
 			zoomCurrentDegrees_ = Mathf.Lerp(zoomCurrentDegrees_, zoomTargetDegrees_, rate);
-
-			UpdateGaugeVisibility();
 		}
 
 		private void LateUpdate() {
@@ -255,137 +233,6 @@ namespace HeadTrackARKit {
 			Kino.Log.Info("[HeadTrackARKit] Zoom reset.");
 		}
 
-		/// <summary>
-		/// Hides (or restores) MultiHUD's gauge object(s) depending on whether PhoneCam is
-		/// currently enabled - see the field comments on gaugeObjects_/GaugeNameKeywords for why
-		/// this exists instead of another attempt to keep the gauges in sync with the camera.
-		/// Runs every frame from Update(), but the actual scene search only happens periodically
-		/// (see lastGaugeSearchTime_) and only while nothing has been found yet.
-		/// </summary>
-		private void UpdateGaugeVisibility() {
-			if (config_.HideGaugesWhileTracking && config_.Enabled) {
-				if (Time.unscaledTime - lastGaugeSearchTime_ > 2f) {
-					lastGaugeSearchTime_ = Time.unscaledTime;
-					gaugeObjects_.RemoveAll(go => go == null);
-					if (gaugeObjects_.Count == 0) {
-						RefreshGaugeObjects();
-					}
-				}
-				SetGaugesHidden(true);
-			}
-			else {
-				SetGaugesHidden(false);
-			}
-		}
-
-		/// <summary>
-		/// Searches every GameObject currently loaded in memory (not just the "active" scene) for
-		/// anything whose name contains one of GaugeNameKeywords, including inactive objects.
-		///
-		/// The first attempt at this (0.3.10) walked SceneManager.GetActiveScene().GetRootGameObjects()
-		/// and found nothing, ever - confirmed by a real KSL log showing zero "Found N gauge
-		/// object(s)" lines across a full test session, even after MultiHUD itself logged finding
-		/// the speedometer at runtime. Root cause: MultiHUD's own log named the object's path
-		/// "KeepAlive(Clone)/UGUI/...", and CarX separately logs loading several scenes
-		/// "Additive" (nfs_studio, Race, vp_parking, etc.) - "KeepAlive(Clone)" is almost certainly
-		/// a DontDestroyOnLoad object, and DontDestroyOnLoad objects (along with anything in an
-		/// additively-loaded scene) are NOT returned by GetActiveScene().GetRootGameObjects(),
-		/// which only covers whichever single scene Unity currently considers "active." Switched to
-		/// Resources.FindObjectsOfTypeAll, which walks every loaded GameObject regardless of which
-		/// scene (or DontDestroyOnLoad) it lives in - filtered to go.scene.IsValid() so it only
-		/// matches real scene instances, not unrelated prefab/asset references that happen to be
-		/// loaded in memory.
-		/// </summary>
-		private void RefreshGaugeObjects() {
-			GameObject[] all = Resources.FindObjectsOfTypeAll<GameObject>();
-			foreach (GameObject go in all) {
-				if (!go.scene.IsValid()) continue;
-
-				string lower = go.name.ToLowerInvariant();
-				foreach (string keyword in GaugeNameKeywords) {
-					if (lower.Contains(keyword)) {
-						gaugeObjects_.Add(go);
-						break;
-					}
-				}
-			}
-
-			if (gaugeObjects_.Count > 0) {
-				var names = new List<string>();
-				foreach (GameObject go in gaugeObjects_) names.Add(go.name);
-				Kino.Log.Info($"[HeadTrackARKit] Found {gaugeObjects_.Count} gauge object(s): {string.Join(", ", names)}");
-			}
-		}
-
-		/// <summary>
-		/// On-demand diagnostic scan for the dashboard-needle wobble report - see the field comment
-		/// on DashboardDiagnosticKeywords for why this exists as a separate, wider search from the
-		/// HUD-hide one above. Logs every match's full hierarchy path (root-to-leaf) and whether a
-		/// Camera component sits anywhere in its ancestor chain - meant to be run right when the
-		/// wobble is visible in-game, so the resulting log capture is directly correlated with the
-		/// actual symptom instead of being a generic startup dump.
-		/// </summary>
-		private void LogDashboardGaugeDiagnostics() {
-			GameObject[] all = Resources.FindObjectsOfTypeAll<GameObject>();
-			int matchCount = 0;
-
-			Kino.Log.Info("[HeadTrackARKit][dash-diag] Scan starting...");
-
-			foreach (GameObject go in all) {
-				if (!go.scene.IsValid()) continue;
-
-				string lower = go.name.ToLowerInvariant();
-				bool matches = false;
-				foreach (string keyword in DashboardDiagnosticKeywords) {
-					if (lower.Contains(keyword)) {
-						matches = true;
-						break;
-					}
-				}
-				if (!matches) continue;
-
-				matchCount++;
-				if (matchCount > 60) {
-					Kino.Log.Info("[HeadTrackARKit][dash-diag] Stopping early at 60 matches to avoid flooding the log.");
-					break;
-				}
-
-				bool underCamera = false;
-				var pathParts = new List<string> { go.name };
-				Transform t = go.transform.parent;
-				while (t != null) {
-					pathParts.Insert(0, t.name);
-					if (t.GetComponent<Camera>() != null) underCamera = true;
-					t = t.parent;
-				}
-
-				Kino.Log.Info($"[HeadTrackARKit][dash-diag] '{string.Join("/", pathParts)}' underCamera={underCamera}");
-			}
-
-			Kino.Log.Info($"[HeadTrackARKit][dash-diag] Scan complete - {matchCount} candidate object(s) matched.");
-		}
-
-		/// <summary>
-		/// Applies the hidden/shown state to every currently-known gauge object. Only logs on an
-		/// actual state change (not every frame), and re-applies to any newly-found objects even if
-		/// the overall state didn't just change, so an object found mid-session while already
-		/// hidden still gets hidden immediately instead of waiting for the next toggle.
-		/// </summary>
-		private void SetGaugesHidden(bool hidden) {
-			bool changed = hidden != gaugesHidden_;
-			gaugesHidden_ = hidden;
-
-			foreach (GameObject go in gaugeObjects_) {
-				if (go != null && go.activeSelf == hidden) {
-					go.SetActive(!hidden);
-				}
-			}
-
-			if (changed && gaugeObjects_.Count > 0) {
-				Kino.Log.Info($"[HeadTrackARKit] {(hidden ? "Hiding" : "Restoring")} {gaugeObjects_.Count} gauge object(s) (MultiHUD conflict workaround).");
-			}
-		}
-
 		private void HandleOscMessage(OscMessage msg) {
 			switch (msg.Address) {
 				case "/lota/camera/position":
@@ -413,6 +260,7 @@ namespace HeadTrackARKit {
 				Quaternion unityRot = ArKitConversion.ToUnityRotation(latestArRotation_);
 				state_.PushSample(unityPos, unityRot);
 				lastRawArEuler_ = NormalizeEulerForLog(unityRot.eulerAngles);
+				lastRawArPosition_ = unityPos;
 			}
 		}
 
@@ -471,6 +319,10 @@ namespace HeadTrackARKit {
 
 		private static string FormatEuler(Vector3 e) {
 			return $"(x={e.x:F0},y={e.y:F0},z={e.z:F0})";
+		}
+
+		private static string FormatVector(Vector3 v) {
+			return $"(x={v.x:F2},y={v.y:F2},z={v.z:F2})";
 		}
 
 		private void Calibrate() {
@@ -537,6 +389,8 @@ namespace HeadTrackARKit {
 				if (config_.ClippingGuardEnabled && posOffset.sqrMagnitude > 1e-6f) {
 					posOffset = ApplyClippingGuard(t, posOffset);
 				}
+
+				lastAppliedPosOffset_ = posOffset;
 
 				t.position += t.rotation * posOffset;
 				t.rotation = t.rotation * rotOffset;
@@ -703,6 +557,12 @@ namespace HeadTrackARKit {
 					$"[HeadTrackARKit][diag] incomingEuler={FormatEuler(lastRawArEuler_)} " +
 					$"appliedOffsetEuler={FormatEuler(lastAppliedOffsetEuler_)} " +
 					$"invertPitch={config_.InvertPitch} invertYaw={config_.InvertYaw}");
+				// Position diagnostics (0.3.14) - see the field comments on lastRawArPosition_/
+				// lastAppliedPosOffset_ for why this exists.
+				Kino.Log.Info(
+					$"[HeadTrackARKit][diag] incomingPos={FormatVector(lastRawArPosition_)} " +
+					$"appliedPosOffset={FormatVector(lastAppliedPosOffset_)} " +
+					$"maxPositionOffset={config_.MaxPositionOffset:F2} positionSensitivity={config_.PositionSensitivity:F2}");
 			}
 		}
 
@@ -930,13 +790,6 @@ namespace HeadTrackARKit {
 				config_.PositionRangeUpgraded = true;
 			}
 
-			// Same one-time-bump pattern for the new gauge-hide workaround - defaults it to ON
-			// (the chosen fix for the recurring gauge-desync reports) without a plain bool default
-			// silently reverting a user's own later choice to turn it back off.
-			if (!config_.GaugeWorkaroundDefaultsApplied) {
-				config_.HideGaugesWhileTracking = true;
-				config_.GaugeWorkaroundDefaultsApplied = true;
-			}
 			if (config_.ZoomSensitivity <= 0) config_.ZoomSensitivity = 1.5f;
 			if (config_.MaxZoomOffset <= 0) config_.MaxZoomOffset = 30f;
 			if (config_.ZoomSmoothing <= 0) config_.ZoomSmoothing = 0.2f;
@@ -1076,30 +929,6 @@ namespace HeadTrackARKit {
 			}
 
 			Kino.UI.HorizontalLine();
-			Kino.UI.GroupLabel("Gauge HUD workaround");
-			Kino.UI.Label("MultiHUD's speedometer reads the camera directly, so it reacts to every head " +
-				"movement/zoom the same way the 3D view does - two direct fixes didn't stop that from " +
-				"looking wrong. This hides it entirely while PhoneCam is enabled instead, and restores " +
-				"it the moment PhoneCam is turned off.");
-
-			bool hideGauges = config_.HideGaugesWhileTracking;
-			if (Kino.UI.Toggle("Hide gauges while PhoneCam is enabled", ref hideGauges)) {
-				config_.HideGaugesWhileTracking = hideGauges;
-				if (!hideGauges) SetGaugesHidden(false);
-			}
-
-			Kino.UI.Label(gaugeObjects_.Count > 0
-				? $"Found {gaugeObjects_.Count} gauge object(s) to hide."
-				: "No gauge object found yet - only searches while this is on and PhoneCam is enabled, so get into a session with the HUD visible first.");
-
-			Kino.UI.Label("If the 3D dashboard gauge needles (not the 2D HUD above) spin/wobble while " +
-				"looking around, that's a different, not-yet-identified object - press this the moment " +
-				"you see it happening, then send the KSL log:");
-			if (Kino.UI.Button("Log dashboard gauge diagnostics")) {
-				LogDashboardGaugeDiagnostics();
-			}
-
-			Kino.UI.HorizontalLine();
 
 			Kino.UI.Label(state_.IsCalibrated ? "Calibrated: yes" : "Calibrated: no - press F9 or the button below");
 
@@ -1223,7 +1052,6 @@ namespace HeadTrackARKit {
 			Kino.UI.Label("Leaning/walking moves the camera too - raise 'Max position offset' in Sensitivity/Safety clamps for bigger, room-scale movement.");
 			Kino.UI.Label("Looking/turning fully around (pitch and yaw) has no stopping point - only roll is limited by the safety clamp.");
 			Kino.UI.Label("Cockpit clipping guard (off by default) stops the camera short of the dashboard/seat when leaning in.");
-			Kino.UI.Label("Gauges hide automatically while PhoneCam is enabled (toggle in 'Gauge HUD workaround') since MultiHUD's speedometer reacts to every head movement/zoom otherwise.");
 
 			Kino.UI.HorizontalLine();
 			Kino.UI.Hyperlink("Get LOTA on the App Store", "https://apps.apple.com/app/id6760984302");
