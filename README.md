@@ -9,6 +9,29 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.3.16** - Confirmed v0.3.15's rotation fix worked (log shows `Loading [PhoneCam 0.3.15 ...]`,
+`incomingEuler`/`appliedOffsetEuler` no longer showing the pitch/yaw coupling). This round's ask:
+make sure real-world stepping (e.g. two steps to the right) is actually detected and applied
+correctly, not just rotation. Position had the *same* root-cause bug as the rotation issue:
+`HeadTrackState.GetPositionOffset()` rotated the incoming position delta by the full calibration
+orientation's inverse (`baseRotationInverse_` - every axis: yaw, pitch, *and* roll). Since this rig
+calibrates with the phone rolled ~90 degrees, rotating a horizontal step vector through that much
+roll swaps it onto the *vertical* axis of the result - so a real step to the side was arriving at
+the camera mostly as an up/down offset instead of left/right, easy to mistake for "stepping does
+nothing" if it happened to get eaten by clamping, or just look wrong. **Fixed the same way as the
+rotation bug**: position delta is now rotated by a *yaw-only* calibration frame
+(`baseYawOnlyInverse_`, built from `ComputeWorldYawPitchRoll`'s yaw component only) instead of the
+full 3D orientation. Yaw-only rotation can't tilt world-vertical into horizontal or vice versa, so
+real up/down steps stay on Y and real left/right/forward/back steps stay on the horizontal plane,
+regardless of the phone's mounting roll. Calibration-time yaw still decides what "forward" means
+for the session (so leaning/stepping forward always pushes the camera forward even if you turn
+your head afterward) - only the roll/pitch contamination is removed.
+
+To verify: press F9 to calibrate, then physically take a couple of real steps to the side and
+check the heartbeat log's `incomingPos`/`appliedPosOffset` lines - the offset's dominant axis
+should now match the direction you actually moved (x for left/right, y for up/down, z for
+forward/back), not a mix.
+
 **0.3.15** - Same "look left = up, look right = down" symptom kept coming back even after 0.3.13
 removed the pitch/yaw swap, and the 0.3.14 log finally explained why: this rig's incoming roll
 sits around 85-98 degrees *constantly* - the phone is physically held/mounted rolled about 90

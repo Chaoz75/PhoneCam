@@ -36,13 +36,16 @@ namespace HeadTrackARKit.Tracking {
 
 		private bool isCalibrated_;
 		private Vector3 basePosition_;
-		private Quaternion baseRotationInverse_ = Quaternion.identity;
 
 		// 0.3.15: world-referenced calibration baseline for rotation - see GetRotationOffsetEuler's
-		// doc comment for why yaw/pitch are measured this way instead of via baseRotationInverse_.
+		// doc comment for why yaw/pitch are measured this way instead of via a full-orientation delta.
 		private float baseYaw_;
 		private float basePitch_;
 		private float baseRoll_;
+
+		// 0.3.16: yaw-only calibration frame for translation - see GetPositionOffset's doc comment
+		// for why this replaced the old full-orientation baseRotationInverse_.
+		private Quaternion baseYawOnlyInverse_ = Quaternion.identity;
 
 		public bool IsCalibrated => isCalibrated_;
 		public bool HasSignal => hasRawSample_;
@@ -69,8 +72,8 @@ namespace HeadTrackARKit.Tracking {
 			if (!hasSmoothedSample_) return;
 
 			basePosition_ = smoothedPosition_;
-			baseRotationInverse_ = Quaternion.Inverse(smoothedRotation_);
 			ComputeWorldYawPitchRoll(smoothedRotation_, out baseYaw_, out basePitch_, out baseRoll_);
+			baseYawOnlyInverse_ = Quaternion.Inverse(Quaternion.Euler(0f, baseYaw_, 0f));
 			isCalibrated_ = true;
 		}
 
@@ -79,14 +82,36 @@ namespace HeadTrackARKit.Tracking {
 		}
 
 		/// <summary>
-		/// Delta position, in the *head's own local frame at calibration time*, sensitivity-scaled
-		/// and clamped. Meant to be rotated into the game camera's current facing before being added
-		/// to its world position (see HeadTrackMod.ApplyToCamera).
+		/// Delta position, in a calibration-time frame, sensitivity-scaled and clamped. Meant to be
+		/// rotated into the game camera's current facing before being added to its world position
+		/// (see HeadTrackMod.OnCameraPreCull).
+		///
+		/// ARKit's position stream is real-world, gravity-aligned meters (see ArKitConversion -
+		/// only Z gets mirrored for handedness; X/Y pass straight through), so a real step to the
+		/// side is genuinely a horizontal-plane vector and a real step up/down is genuinely a
+		/// vertical one, regardless of how the phone happens to be held. Through 0.3.15 this delta
+		/// was rotated by the *full* calibration orientation's inverse (every axis: yaw, pitch, AND
+		/// roll) - the same quantity that turned out to cause the look-direction bug (see
+		/// GetRotationOffsetEuler's doc comment): this rig sits with roughly 90 degrees of roll at
+		/// calibration time. Rotating a horizontal step vector through that much roll swaps it onto
+		/// the *vertical* axis of the result, so "step right" was arriving at HeadTrackMod as
+		/// mostly an up/down offset instead of a left/right one - easy to mistake for "stepping
+		/// doesn't do anything" if the vertical clamp happened to eat it, or just confusing if it
+		/// visibly moved the camera the wrong way.
+		///
+		/// 0.3.16 fixes this the same way as the rotation bug: only the *yaw* component of the
+		/// calibration orientation is used to build the frame (<see cref="baseYawOnlyInverse_"/>),
+		/// not the full 3D orientation. Yaw-only rotation can't tilt the world's vertical axis into
+		/// a horizontal one or vice versa, so real up/down steps stay on Y and real left/right/
+		/// forward/back steps stay on the horizontal plane, no matter how much roll the phone is
+		/// physically held at. Calibration-time yaw is still what "forward" means for the rest of
+		/// the session (so "lean forward" always pushes the camera forward even if you turn your
+		/// head afterward) - only the roll/pitch contamination is removed.
 		/// </summary>
 		public Vector3 GetPositionOffset() {
 			if (!isCalibrated_ || !hasSmoothedSample_) return Vector3.zero;
 
-			Vector3 delta = baseRotationInverse_ * (smoothedPosition_ - basePosition_);
+			Vector3 delta = baseYawOnlyInverse_ * (smoothedPosition_ - basePosition_);
 			delta *= PositionSensitivity;
 
 			return new Vector3(
