@@ -63,5 +63,26 @@ namespace HeadTrackARKit {
 		/// sender, same as before this setting existed.
 		/// </summary>
 		string PhoneIpFilter { get; set; }
+
+		// --- Orientation correction ---
+
+		/// <summary>
+		/// Compensates for how the phone is physically mounted relative to what LOTA's raw
+		/// ARKit axes assume - one of 0/90/180/270. If tilting the phone up/down moves the
+		/// camera left/right instead of up/down (a known symptom when the phone ends up
+		/// mounted rotated relative to LOTA's expected orientation), cycle this until up/down
+		/// and left/right map correctly. Applied identically to both the incoming position and
+		/// rotation data, since both come from the same physical mount.
+		/// </summary>
+		int MountRollDegrees { get; set; }
+
+		// --- Privacy ---
+
+		/// <summary>
+		/// When false (the default), IP addresses shown in the settings panel (last sender IP,
+		/// this PC's LAN IP, phone IP filter) are masked out so they aren't exposed on stream or
+		/// in screenshots. Toggle on temporarily to read/edit the real values.
+		/// </summary>
+		bool ShowSensitiveInfo { get; set; }
 	}
 }

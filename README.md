@@ -9,6 +9,31 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.3.7** - Confirmed via real-game log: 0.3.6's view-matrix override works, including in Kino's
+Custom Camera mode - the head-tracked camera moves correctly now. Four follow-up fixes from that
+same test session:
+- **Pitch/yaw axis fix.** Tilting the phone up/down (and moving it up/down) was rotating/moving
+  the camera left/right instead of up/down. Added a "Phone mount orientation" setting (cycles
+  0/90/180/270 via a button in the menu) that compensates for how the phone happens to be
+  physically mounted relative to the orientation LOTA's raw ARKit axes assume - applied
+  identically to the incoming position and rotation data via proper rotation (quaternion
+  conjugation, not a naive component swap) so it stays correct for compound head movements too.
+  Defaults to 0 (unchanged behavior) - cycle it in-game until up/down and left/right map correctly.
+- **Dashboard gauges no longer move with the head-tracked view.** The previous approach wrote the
+  offset directly onto the camera's real `Transform`, which meant anything parented under the
+  camera (like the gauge HUD) inherited the same rotation. 0.3.7 computes the offset pose in local
+  variables instead and only ever touches the render's view/culling matrices - the camera's actual
+  Transform is never modified, so nothing parented to it moves.
+- **Camera now snaps back to normal when the mod is disabled (or before calibration).** Since the
+  real Transform is no longer touched at all, there's nothing left to "undo" - `OnCameraPreCull`
+  now also explicitly calls `ResetWorldToCameraMatrix()`/`ResetCullingMatrix()` in both cases so
+  the view reverts to the game's own default immediately instead of staying stuck at the last
+  head-tracked pose.
+- **Privacy: IP addresses are now masked by default.** The last-sender IP, this PC's LAN IP, and
+  the phone IP filter are shown digit-masked (e.g. `•••.•••.•.••`) unless a new "Show IP
+  addresses" toggle (off by default) is switched on - keeps the settings panel safe to show on
+  stream or in screenshots without exposing home network details.
+
 **0.3.6** - Real-game test of 0.3.5 confirmed the handler runs, resolves the correct on-screen
 camera, and applies last every frame - but in Kino's own "Custom Camera" mode (the mouse/keyboard
 free-look mode) the view still didn't move at all. Best-evidenced explanation: that camera system
@@ -325,6 +350,16 @@ libs/                       You put KSL.API.dll / UnityEngine.CoreModule.dll her
   re-assigns the view matrix directly every frame instead of relying on the Transform alone. This
   is inferred, not confirmed - `kino.dll` still can't be inspected directly - so it needs a real
   retest, specifically in that Custom Camera mode, to know if it worked.
+- **Confirmed working (0.3.7): the 0.3.6 view-matrix override does move the camera in Kino's
+  Custom Camera mode**, per a real play-session log. Same test surfaced three follow-up issues,
+  all addressed in 0.3.7 - see the changelog entry above for each: a pitch/yaw axis swap (now a
+  cycle-able "phone mount orientation" setting), the dashboard gauge HUD moving along with the
+  head-tracked view (now fixed by never writing to the camera's real Transform, only its render
+  matrices), and the camera not reverting when disabled (now explicitly reset).
+- **Phone mount orientation correction (0.3.7) is a manual cycle, not auto-detected.** There's no
+  way to know from here which of the 4 positions (0/90/180/270) matches any given phone
+  mount/holder, since that depends entirely on how the phone is physically oriented when mounted -
+  it has to be tuned live in-game by cycling the button until movement direction feels right.
 - **`Unable to save config 'PhoneCam.ksc': NullReferenceException`** appears repeatedly in the
   logs, correlated with rapid Enabled-toggle/F9/zoom-reset actions. The stack trace is entirely
   inside KSL's own obfuscated internals, not this mod's code, so there's nothing to fix on this

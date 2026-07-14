@@ -22,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.3.6", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.3.7", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.3.6";
+		private const string CurrentVersion = "0.3.7";
 
 		private const int DefaultOscPort = 9000;
 
@@ -208,7 +208,8 @@ namespace HeadTrackARKit {
 			switch (msg.Address) {
 				case "/lota/camera/position":
 					if (msg.Args.Length >= 3) {
-						latestArPosition_ = new Vector3(msg.GetFloat(0), msg.GetFloat(1), msg.GetFloat(2));
+						Vector3 raw = new Vector3(msg.GetFloat(0), msg.GetFloat(1), msg.GetFloat(2));
+						latestArPosition_ = CorrectMountOrientation(raw);
 						receivedPosition_ = true;
 					}
 					break;
@@ -216,7 +217,8 @@ namespace HeadTrackARKit {
 				case "/lota/camera/rotation":
 					if (msg.Args.Length >= 4) {
 						// LOTA sends quaternion as x, y, z, w.
-						latestArRotation_ = new Quaternion(msg.GetFloat(0), msg.GetFloat(1), msg.GetFloat(2), msg.GetFloat(3));
+						Quaternion raw = new Quaternion(msg.GetFloat(0), msg.GetFloat(1), msg.GetFloat(2), msg.GetFloat(3));
+						latestArRotation_ = CorrectMountOrientation(raw);
 						receivedRotation_ = true;
 					}
 					break;
@@ -231,6 +233,30 @@ namespace HeadTrackARKit {
 				Quaternion unityRot = ArKitConversion.ToUnityRotation(latestArRotation_);
 				state_.PushSample(unityPos, unityRot);
 			}
+		}
+
+		/// <summary>
+		/// Rotation applied to raw incoming ARKit data (before ArKitConversion touches it) to
+		/// compensate for how the phone happens to be physically mounted relative to the
+		/// orientation LOTA's raw axes assume - see IHeadTrackConfig.MountRollDegrees. 0 is a
+		/// no-op (matches every version before 0.3.7).
+		/// </summary>
+		private Quaternion MountCorrection => config_.MountRollDegrees == 0
+			? Quaternion.identity
+			: Quaternion.AngleAxis(config_.MountRollDegrees, Vector3.forward);
+
+		private Vector3 CorrectMountOrientation(Vector3 rawPosition) {
+			if (config_.MountRollDegrees == 0) return rawPosition;
+			return MountCorrection * rawPosition;
+		}
+
+		private Quaternion CorrectMountOrientation(Quaternion rawRotation) {
+			if (config_.MountRollDegrees == 0) return rawRotation;
+			// Conjugation (C * q * C^-1), not a plain multiply - this is the proper-rotation way
+			// to "relabel" which physical axis means pitch vs yaw vs roll, so it stays correct
+			// for compound head movements too, not just pure up/down or pure left/right.
+			Quaternion c = MountCorrection;
+			return c * rawRotation * Quaternion.Inverse(c);
 		}
 
 		private void Calibrate() {
@@ -251,7 +277,13 @@ namespace HeadTrackARKit {
 			// unconditionally settles which one it is.
 			LogCameraDiagnostics(cam);
 
-			if (!config_.Enabled) return;
+			if (!config_.Enabled) {
+				// Make sure a previous frame's override doesn't linger once the mod is turned
+				// off - without this, the view would stay stuck at its last head-tracked pose
+				// instead of snapping back to whatever the game's own camera logic drives it to.
+				ResetCameraOverride(cam);
+				return;
+			}
 
 			// 0.3.4's real fix (SRP hook) proved the plumbing works: GetActiveCamera() correctly
 			// resolved to the actual render camera the whole session. But the goal now is a
@@ -270,7 +302,10 @@ namespace HeadTrackARKit {
 				cam.fieldOfView = Mathf.Clamp(cam.fieldOfView + zoomOffsetDegrees_, 1f, 179f);
 			}
 
-			if (!state_.IsCalibrated) return;
+			if (!state_.IsCalibrated) {
+				ResetCameraOverride(cam);
+				return;
+			}
 
 			Vector3 posOffset = state_.GetPositionOffset();
 			Quaternion rotOffset = state_.GetRotationOffset();
@@ -281,37 +316,43 @@ namespace HeadTrackARKit {
 				posOffset = ApplyClippingGuard(t, posOffset);
 			}
 
-			t.position += t.rotation * posOffset;
-			t.rotation = t.rotation * rotOffset;
+			// 0.3.7: compute the offset pose in local variables instead of writing it onto the
+			// camera's real Transform. Writing to the real Transform moved anything parented
+			// under the camera right along with it - including the dashboard gauge HUD, per the
+			// user's report of the gauges drifting around as the head-tracked view rotated. Only
+			// the render's view/culling matrices are touched below, so nothing in the scene
+			// hierarchy is affected - which also means there's nothing left to "undo" when the
+			// mod is disabled or not yet calibrated (see ResetCameraOverride above): the real
+			// Transform was never touched in the first place.
+			Vector3 virtualPosition = t.position + t.rotation * posOffset;
+			Quaternion virtualRotation = t.rotation * rotOffset;
 
-			// 0.3.5 confirmed (via diagnostic log) that this handler runs, resolves the correct
-			// on-screen camera, and writes to its Transform last every frame - yet in Kino's own
-			// "Custom Camera" mode (the one driven by mouse/keyboard look, per the user's report)
-			// the view still didn't move at all. The most likely remaining explanation: that
-			// camera system sets Camera.worldToCameraMatrix explicitly rather than letting Unity
-			// derive the view matrix from the Transform each frame - and once a custom matrix is
-			// set, Unity keeps using it and ignores further Transform changes for rendering
-			// purposes (a well-known Unity gotcha for exactly this kind of camera rig) until
-			// ResetWorldToCameraMatrix() is called. Rebuilding and re-assigning the view matrix
-			// from this now-offset transform, unconditionally and last, sidesteps that entirely:
-			// it's mathematically identical to Unity's own default when nothing else is
-			// customizing the matrix (so this is a no-op visually in normal driving/replay/photo
-			// modes), and it wins outright when something is.
-			ApplyViewMatrixFromTransform(cam);
+			ApplyViewMatrix(cam, virtualPosition, virtualRotation);
 		}
 
 		/// <summary>
-		/// Manually rebuilds <c>Camera.worldToCameraMatrix</c> from the camera's current
-		/// Transform, matching what Unity computes by default. See the comment at the call site
-		/// in <see cref="OnCameraPreCull"/> for why this is necessary at all.
+		/// Builds Camera.worldToCameraMatrix (and the matching cullingMatrix, so objects near the
+		/// edge of frame aren't culled against the camera's stale, un-offset Transform) from an
+		/// explicit position/rotation, without ever writing to the camera's actual Transform. See
+		/// the comment at the call site in <see cref="OnCameraPreCull"/> for why this is built
+		/// from local variables rather than the Transform, and the comment on the original
+		/// Custom-Camera-mode fix (0.3.6) for why the view matrix needs to be set explicitly at
+		/// all rather than relying on Unity to derive it from the Transform.
 		/// </summary>
-		private static void ApplyViewMatrixFromTransform(Camera cam) {
-			Matrix4x4 m = cam.transform.worldToLocalMatrix;
-			// Unity's camera space looks down local -Z, while a plain worldToLocalMatrix follows
+		private static void ApplyViewMatrix(Camera cam, Vector3 position, Quaternion rotation) {
+			Matrix4x4 view = Matrix4x4.TRS(position, rotation, Vector3.one).inverse;
+			// Unity's camera space looks down local -Z, while a plain inverse-TRS matrix follows
 			// the transform's own +Z-forward convention - flipping the Z row is the standard way
 			// to reconcile the two when building a view matrix manually.
-			m.SetRow(2, -m.GetRow(2));
-			cam.worldToCameraMatrix = m;
+			view.SetRow(2, -view.GetRow(2));
+			cam.worldToCameraMatrix = view;
+			cam.cullingMatrix = cam.projectionMatrix * view;
+		}
+
+		/// <summary>Reverts a camera to the game's own default view/culling behavior.</summary>
+		private static void ResetCameraOverride(Camera cam) {
+			cam.ResetWorldToCameraMatrix();
+			cam.ResetCullingMatrix();
 		}
 
 		/// <summary>
@@ -650,6 +691,20 @@ namespace HeadTrackARKit {
 			if (config_.ClippingGuardLayerMask == 0) config_.ClippingGuardLayerMask = ~0;
 		}
 
+		/// <summary>
+		/// Replaces every digit in an address with "•", leaving separators (dots/colons) intact,
+		/// so the shape stays recognizable on-screen without exposing the actual value in a
+		/// screenshot or stream. See IHeadTrackConfig.ShowSensitiveInfo.
+		/// </summary>
+		private static string MaskAddress(string address) {
+			if (string.IsNullOrEmpty(address)) return address;
+			var sb = new System.Text.StringBuilder(address.Length);
+			foreach (char c in address) {
+				sb.Append(char.IsDigit(c) ? '•' : c);
+			}
+			return sb.ToString();
+		}
+
 		public override void OnUIDraw() {
 			bool connected = receiver_.IsRunning &&
 			                  receiver_.LastMessageTick != 0 &&
@@ -658,8 +713,10 @@ namespace HeadTrackARKit {
 			Kino.UI.Label("LOTA - LiDAR Over the Air (free, App Store) streams ARKit camera pose to this mod over OSC.");
 			Kino.UI.Label(connected ? "Status: receiving data" : "Status: no data (check LOTA is streaming, same Wi-Fi, matching port)");
 
+			bool showSensitive = config_.ShowSensitiveInfo;
 			string senderIp = receiver_.LastSenderAddress;
-			Kino.UI.Label(senderIp != null ? $"Last sender IP: {senderIp}" : "Last sender IP: (none yet)");
+			string senderDisplay = senderIp == null ? "(none yet)" : (showSensitive ? senderIp : MaskAddress(senderIp));
+			Kino.UI.Label($"Last sender IP: {senderDisplay}");
 
 			Kino.UI.HorizontalLine();
 			Kino.UI.GroupLabel("Update");
@@ -714,8 +771,13 @@ namespace HeadTrackARKit {
 			}
 
 			Kino.UI.Label("This PC's LAN IP (edit if auto-detect picked the wrong adapter):");
-			if (Kino.UI.Input(ref localIpText_, 45, "^[0-9a-fA-F:.]{0,45}$")) {
-				config_.LocalIpOverride = localIpText_;
+			if (showSensitive) {
+				if (Kino.UI.Input(ref localIpText_, 45, "^[0-9a-fA-F:.]{0,45}$")) {
+					config_.LocalIpOverride = localIpText_;
+				}
+			}
+			else {
+				Kino.UI.Label($"  {MaskAddress(localIpText_)}  (enable 'Show IP addresses' below to view/edit)");
 			}
 			Kino.UI.Label("Type the IP above and the port above into LOTA's Transmission Settings destination IP.");
 			if (Kino.UI.Button("Refresh IP (auto-detect)")) {
@@ -723,9 +785,31 @@ namespace HeadTrackARKit {
 			}
 
 			Kino.UI.Label("Phone's IP (optional - only accept data from this exact address):");
-			if (Kino.UI.Input(ref phoneIpText_, 45, "^[0-9a-fA-F:.]{0,45}$")) {
-				config_.PhoneIpFilter = phoneIpText_;
-				receiver_.AllowedSenderFilter = phoneIpText_;
+			if (showSensitive) {
+				if (Kino.UI.Input(ref phoneIpText_, 45, "^[0-9a-fA-F:.]{0,45}$")) {
+					config_.PhoneIpFilter = phoneIpText_;
+					receiver_.AllowedSenderFilter = phoneIpText_;
+				}
+			}
+			else if (!string.IsNullOrEmpty(phoneIpText_)) {
+				Kino.UI.Label($"  {MaskAddress(phoneIpText_)}  (enable 'Show IP addresses' below to view/edit)");
+			}
+			else {
+				Kino.UI.Label("  (not set)");
+			}
+
+			Kino.UI.HorizontalLine();
+			Kino.UI.GroupLabel("Privacy");
+			Kino.UI.Label("Off by default - masks IP addresses above so they aren't exposed on stream or in screenshots.");
+			if (Kino.UI.Toggle("Show IP addresses", ref showSensitive)) {
+				config_.ShowSensitiveInfo = showSensitive;
+			}
+
+			Kino.UI.HorizontalLine();
+			Kino.UI.GroupLabel("Phone mount orientation");
+			Kino.UI.Label("If tilting the phone up/down moves the camera left/right instead of up/down, tap to cycle this.");
+			if (Kino.UI.Button($"Orientation: {config_.MountRollDegrees}° (tap to cycle)")) {
+				config_.MountRollDegrees = (config_.MountRollDegrees + 90) % 360;
 			}
 
 			Kino.UI.HorizontalLine();
@@ -829,7 +913,8 @@ namespace HeadTrackARKit {
 			Kino.UI.Label("1. On your iPhone, open LOTA (free, App Store) - no subscription needed.");
 			Kino.UI.Label("2. Stay on the main camera page (any mode except Motion).");
 			Kino.UI.Label("3. Tap the status bar pill (Transmission Settings), enable OSC.");
-			Kino.UI.Label($"4. Set the destination IP to {localIpText_} and the port to {portText_} (shown above too).");
+			string ipForDisplay = config_.ShowSensitiveInfo ? localIpText_ : MaskAddress(localIpText_);
+			Kino.UI.Label($"4. Set the destination IP to {ipForDisplay} and the port to {portText_} (shown above too).");
 			Kino.UI.Label("5. Make sure phone and PC are on the same Wi-Fi, then tap the shutter with STREAM selected.");
 
 			Kino.UI.HorizontalLine();
