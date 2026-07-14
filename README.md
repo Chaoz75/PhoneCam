@@ -9,6 +9,33 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.3.8** - Real-game test of 0.3.7 surfaced two problems with that build's approach, both
+addressed here:
+- **Zoom silently did nothing to the actual view, even though the gauge HUD visibly reacted to
+  it.** That split is the tell: `fieldOfView` was being changed correctly (so anything reading
+  that property directly, like the gauge Canvas's own scaling, responded), but Kino's Custom
+  Camera mode almost certainly freezes `Camera.projectionMatrix` too - the same class of gotcha
+  as the `worldToCameraMatrix` freeze found in 0.3.6, just for projection instead of view. Fixed
+  by rebuilding `projectionMatrix` from `fieldOfView` explicitly and reassigning it every frame,
+  the same way the view matrix already was.
+- **The gauge HUD kept "acting weird" when looking around and zooming, even after 0.3.7 stopped
+  writing the offset onto the camera's real Transform specifically to fix that.** Since it kept
+  happening either way, that theory was wrong. The gauge HUD (from the separate MultiHUD mod) is
+  a "UGUI" Canvas - almost certainly Unity's Screen-Space-Camera render mode, which is *designed*
+  to read the camera's real Transform/fieldOfView directly so it stays glued to the screen.
+  0.3.7's decoupling made the UI and the 3D world disagree with each other (UI tracking the stale
+  Transform/FOV, 3D world rendered from a separately-computed pose) instead of fixing anything.
+  0.3.8 goes back to writing the offset onto the real Transform/FOV (keeps every such system in
+  sync automatically) while still rebuilding the view/projection matrices explicitly afterward, so
+  Kino's Custom Camera mode still can't silently ignore the change either way.
+- **Pitch/yaw axis swap still not fixed** - cycling the "Phone mount orientation" setting didn't
+  resolve it. Rather than guess a third time, this build adds a diagnostic log line (every ~2s,
+  alongside the existing camera heartbeat) printing the raw incoming ARKit euler angles, the
+  post-correction Unity-space euler angles, and the current mount-roll setting - the next log
+  capture (moving the phone through a pure look-left/right, then a pure look-up/down) should show
+  exactly which axis LOTA's data is actually changing for each movement, turning this into a
+  data-driven fix instead of another guess.
+
 **0.3.7** - Confirmed via real-game log: 0.3.6's view-matrix override works, including in Kino's
 Custom Camera mode - the head-tracked camera moves correctly now. Four follow-up fixes from that
 same test session:
@@ -356,10 +383,26 @@ libs/                       You put KSL.API.dll / UnityEngine.CoreModule.dll her
   cycle-able "phone mount orientation" setting), the dashboard gauge HUD moving along with the
   head-tracked view (now fixed by never writing to the camera's real Transform, only its render
   matrices), and the camera not reverting when disabled (now explicitly reset).
-- **Phone mount orientation correction (0.3.7) is a manual cycle, not auto-detected.** There's no
-  way to know from here which of the 4 positions (0/90/180/270) matches any given phone
-  mount/holder, since that depends entirely on how the phone is physically oriented when mounted -
-  it has to be tuned live in-game by cycling the button until movement direction feels right.
+- **Phone mount orientation correction (0.3.7) is a manual cycle, not auto-detected, and as of
+  0.3.8 is still unconfirmed to fix the reported pitch/yaw swap.** Cycling through the 4 settings
+  didn't resolve "look left moves the camera up / look right moves it down" in a real-game test.
+  Rather than guess a third value blind, 0.3.8 adds diagnostic logging (raw ARKit euler vs.
+  corrected euler vs. current mount-roll setting, every ~2s) so the next log capture can show
+  exactly which physical movement changes which axis in LOTA's data - this is the next thing to
+  read once that log comes in.
+- **Kino's Custom Camera mode appears to freeze `Camera.projectionMatrix` independent of
+  `fieldOfView`, in addition to freezing `worldToCameraMatrix` (0.3.6).** Real-game evidence: zoom
+  visibly changed the gauge HUD's own scaling (which reads `fieldOfView` directly) but never the
+  actual rendered view. Fixed in 0.3.8 by rebuilding and reassigning `projectionMatrix` from
+  `fieldOfView` explicitly every frame, mirroring the existing `worldToCameraMatrix` fix.
+- **0.3.7's "stop writing to the camera's real Transform" change was based on an incorrect
+  theory and was reverted in 0.3.8.** The gauge HUD kept reacting even without any Transform
+  writes, which ruled out "the HUD is parented under the camera" as the cause. The HUD (MultiHUD,
+  a separate mod) is a UGUI Canvas, almost certainly Screen-Space-Camera mode, which needs the
+  camera's real Transform/FOV to stay in sync by design - decoupling from it made things worse,
+  not better. 0.3.8 writes to the real Transform/FOV again (keeping every such system in sync)
+  while still separately rebuilding the view/projection matrices to guarantee Kino's Custom
+  Camera mode can't ignore the change.
 - **`Unable to save config 'PhoneCam.ksc': NullReferenceException`** appears repeatedly in the
   logs, correlated with rapid Enabled-toggle/F9/zoom-reset actions. The stack trace is entirely
   inside KSL's own obfuscated internals, not this mod's code, so there's nothing to fix on this

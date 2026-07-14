@@ -22,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.3.7", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.3.8", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.3.7";
+		private const string CurrentVersion = "0.3.8";
 
 		private const int DefaultOscPort = 9000;
 
@@ -44,6 +44,15 @@ namespace HeadTrackARKit {
 		private bool receivedRotation_;
 		private Vector3 latestArPosition_;
 		private Quaternion latestArRotation_ = Quaternion.identity;
+
+		// --- Axis-mapping diagnostics ---
+		// The pitch/yaw swap reported after 0.3.7 (mount orientation cycling didn't fix it)
+		// needs real data rather than another guess - these capture the raw incoming ARKit
+		// rotation and the post-mount-correction Unity-space rotation, both as euler angles, so
+		// the periodic heartbeat log (see LogCameraDiagnostics) can print exactly what's coming
+		// in and what correction is currently applied.
+		private Vector3 lastRawArEuler_;
+		private Vector3 lastCorrectedUnityEuler_;
 
 		private Camera cachedCamera_;
 		private float cameraCacheTime_;
@@ -218,7 +227,10 @@ namespace HeadTrackARKit {
 					if (msg.Args.Length >= 4) {
 						// LOTA sends quaternion as x, y, z, w.
 						Quaternion raw = new Quaternion(msg.GetFloat(0), msg.GetFloat(1), msg.GetFloat(2), msg.GetFloat(3));
-						latestArRotation_ = CorrectMountOrientation(raw);
+						Quaternion corrected = CorrectMountOrientation(raw);
+						latestArRotation_ = corrected;
+						lastRawArEuler_ = NormalizeEulerForLog(raw.eulerAngles);
+						lastCorrectedUnityEuler_ = NormalizeEulerForLog(ArKitConversion.ToUnityRotation(corrected).eulerAngles);
 						receivedRotation_ = true;
 					}
 					break;
@@ -257,6 +269,23 @@ namespace HeadTrackARKit {
 			// for compound head movements too, not just pure up/down or pure left/right.
 			Quaternion c = MountCorrection;
 			return c * rawRotation * Quaternion.Inverse(c);
+		}
+
+		// Unity's eulerAngles are 0..360 per axis, which makes small negative rotations show up
+		// as ~359 degrees - remap to -180..180 so the diagnostic log is actually readable.
+		private static Vector3 NormalizeEulerForLog(Vector3 euler) {
+			return new Vector3(NormalizeAngleForLog(euler.x), NormalizeAngleForLog(euler.y), NormalizeAngleForLog(euler.z));
+		}
+
+		private static float NormalizeAngleForLog(float angle) {
+			angle %= 360f;
+			if (angle > 180f) angle -= 360f;
+			if (angle < -180f) angle += 360f;
+			return angle;
+		}
+
+		private static string FormatEuler(Vector3 e) {
+			return $"(x={e.x:F0},y={e.y:F0},z={e.z:F0})";
 		}
 
 		private void Calibrate() {
@@ -302,56 +331,72 @@ namespace HeadTrackARKit {
 				cam.fieldOfView = Mathf.Clamp(cam.fieldOfView + zoomOffsetDegrees_, 1f, 179f);
 			}
 
-			if (!state_.IsCalibrated) {
-				ResetCameraOverride(cam);
-				return;
+			// 0.3.8: back to writing the head-tracking offset onto the camera's real Transform.
+			// 0.3.7 stopped doing this on the theory that the gauge HUD was moving because it was
+			// parented under the camera's Transform - but a real-game test showed the gauges kept
+			// reacting even without touching the Transform at all, which rules that theory out.
+			// The gauge HUD (MultiHUD, a separate mod) is a "UGUI" Canvas - almost certainly using
+			// Unity's Screen-Space-Camera render mode, which is *designed* to read the camera's
+			// real Transform and fieldOfView directly to stay glued to the screen. Decoupling from
+			// the Transform (0.3.7) made the UI and the 3D world disagree with each other instead
+			// of fixing anything: the UI kept tracking the stale Transform/FOV while the 3D world
+			// rendered from a separately-computed pose, which is what "acting weird" actually was.
+			// Writing to the real Transform/FOV keeps every such system in sync automatically,
+			// exactly like it did before 0.3.7.
+			if (state_.IsCalibrated) {
+				Vector3 posOffset = state_.GetPositionOffset();
+				Quaternion rotOffset = state_.GetRotationOffset();
+
+				Transform t = cam.transform;
+
+				if (config_.ClippingGuardEnabled && posOffset.sqrMagnitude > 1e-6f) {
+					posOffset = ApplyClippingGuard(t, posOffset);
+				}
+
+				t.position += t.rotation * posOffset;
+				t.rotation = t.rotation * rotOffset;
 			}
 
-			Vector3 posOffset = state_.GetPositionOffset();
-			Quaternion rotOffset = state_.GetRotationOffset();
-
-			Transform t = cam.transform;
-
-			if (config_.ClippingGuardEnabled && posOffset.sqrMagnitude > 1e-6f) {
-				posOffset = ApplyClippingGuard(t, posOffset);
-			}
-
-			// 0.3.7: compute the offset pose in local variables instead of writing it onto the
-			// camera's real Transform. Writing to the real Transform moved anything parented
-			// under the camera right along with it - including the dashboard gauge HUD, per the
-			// user's report of the gauges drifting around as the head-tracked view rotated. Only
-			// the render's view/culling matrices are touched below, so nothing in the scene
-			// hierarchy is affected - which also means there's nothing left to "undo" when the
-			// mod is disabled or not yet calibrated (see ResetCameraOverride above): the real
-			// Transform was never touched in the first place.
-			Vector3 virtualPosition = t.position + t.rotation * posOffset;
-			Quaternion virtualRotation = t.rotation * rotOffset;
-
-			ApplyViewMatrix(cam, virtualPosition, virtualRotation);
+			// Rebuild and reassign the view AND projection matrices explicitly, every frame this
+			// mod is enabled - regardless of calibration, so zoom alone (before F9 is ever
+			// pressed) reaches the render too. Two separate Unity gotchas this works around:
+			// (1) Kino's Custom Camera mode sets Camera.worldToCameraMatrix explicitly (0.3.6),
+			// which makes Unity stop deriving the view from the Transform - rebuilding it from the
+			// (now-offset) Transform every frame wins regardless. (2) The zoom-not-working report
+			// points at the same thing happening to Camera.projectionMatrix: fieldOfView changes
+			// were clearly reaching *something* (the gauge Canvas visibly reacted to them), but
+			// never the actual rendered view - consistent with Kino also freezing the projection
+			// matrix independent of fieldOfView. Rebuilding it from fieldOfView explicitly, every
+			// frame, guarantees the render matches whatever FOV was just set. Both are
+			// mathematically identical to Unity's own defaults when nothing else is customizing
+			// them, so this is a no-op visually anywhere Kino isn't fighting it.
+			ApplyCameraOverride(cam);
 		}
 
 		/// <summary>
-		/// Builds Camera.worldToCameraMatrix (and the matching cullingMatrix, so objects near the
-		/// edge of frame aren't culled against the camera's stale, un-offset Transform) from an
-		/// explicit position/rotation, without ever writing to the camera's actual Transform. See
-		/// the comment at the call site in <see cref="OnCameraPreCull"/> for why this is built
-		/// from local variables rather than the Transform, and the comment on the original
-		/// Custom-Camera-mode fix (0.3.6) for why the view matrix needs to be set explicitly at
-		/// all rather than relying on Unity to derive it from the Transform.
+		/// Rebuilds and reassigns Camera.worldToCameraMatrix, Camera.projectionMatrix, and the
+		/// matching cullingMatrix from the camera's current Transform/fieldOfView. See the comment
+		/// at the call site in <see cref="OnCameraPreCull"/> for why both matrices need to be set
+		/// explicitly rather than relying on Unity to derive them normally.
 		/// </summary>
-		private static void ApplyViewMatrix(Camera cam, Vector3 position, Quaternion rotation) {
-			Matrix4x4 view = Matrix4x4.TRS(position, rotation, Vector3.one).inverse;
-			// Unity's camera space looks down local -Z, while a plain inverse-TRS matrix follows
+		private static void ApplyCameraOverride(Camera cam) {
+			Matrix4x4 view = cam.transform.worldToLocalMatrix;
+			// Unity's camera space looks down local -Z, while a plain worldToLocalMatrix follows
 			// the transform's own +Z-forward convention - flipping the Z row is the standard way
 			// to reconcile the two when building a view matrix manually.
 			view.SetRow(2, -view.GetRow(2));
+
+			Matrix4x4 proj = Matrix4x4.Perspective(cam.fieldOfView, cam.aspect, cam.nearClipPlane, cam.farClipPlane);
+
 			cam.worldToCameraMatrix = view;
-			cam.cullingMatrix = cam.projectionMatrix * view;
+			cam.projectionMatrix = proj;
+			cam.cullingMatrix = proj * view;
 		}
 
-		/// <summary>Reverts a camera to the game's own default view/culling behavior.</summary>
+		/// <summary>Reverts a camera to the game's own default view/projection/culling behavior.</summary>
 		private static void ResetCameraOverride(Camera cam) {
 			cam.ResetWorldToCameraMatrix();
+			cam.ResetProjectionMatrix();
 			cam.ResetCullingMatrix();
 		}
 
@@ -466,6 +511,14 @@ namespace HeadTrackARKit {
 					$"[HeadTrackARKit][diag] GetActiveCamera() -> {(active != null ? active.name : "null")}, " +
 					$"CameraSwitch.instance found={switchFound}, calibrated={state_.IsCalibrated}, " +
 					$"photoMode={IsInPhotoMode()}");
+				// Axis-mapping diagnostics: raw incoming ARKit euler vs. the post-mount-correction
+				// Unity-space euler, plus the current correction setting - move the phone through
+				// a pure look-left/look-right and a pure look-up/look-down while this is logging
+				// to see exactly which axis LOTA's data actually changes for each movement.
+				Kino.Log.Info(
+					$"[HeadTrackARKit][diag] rawArEuler={FormatEuler(lastRawArEuler_)} " +
+					$"correctedUnityEuler={FormatEuler(lastCorrectedUnityEuler_)} " +
+					$"mountRollDegrees={config_.MountRollDegrees}");
 			}
 		}
 
