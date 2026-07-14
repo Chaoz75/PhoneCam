@@ -9,6 +9,36 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.3.17** - Two things this round, both aimed at "I step left, nothing happens":
+
+1. **Every single real-game log this project has produced** - all the way back - repeats
+   `Unable to save config 'PhoneCam.ksc': System.NullReferenceException` constantly, on every
+   toggle and every slider drag. That means settings tuned mid-session (raising Max position
+   offset, Position sensitivity, the invert toggles, etc.) have likely never actually survived a
+   game restart - `ApplyDefaultsIfUnset` explicitly defaults every numeric setting, but
+   `LocalIpOverride`/`PhoneIpFilter` (the only two `string` properties) were never defaulted away
+   from a literal `null`, and a null string reaching whatever `(string, string, string)` method
+   KSL's save path uses internally (visible right in the log's stack trace) is a very plausible
+   source of that NullReferenceException. Both now default to `""` on load. Not provably *the*
+   cause (KSL's actual save code is obfuscated, can't be read directly) but it's the one concrete
+   gap that existed and costs nothing to close.
+2. **Added a ground-truth diagnostic**: the heartbeat log now also prints
+   `cameraWorldPosAfterWrite` - the camera's actual world position read back immediately after
+   this mod writes to its Transform, every frame. The v0.3.16 log's math checked out
+   (`appliedPosOffset` genuinely swung across a >0.5m range while stepping side to side, matching
+   real movement scaled by sensitivity) - but "the numbers are right" and "the screen shows it"
+   are two different claims, and there was no way to tell from the old log whether something
+   *else* (CarX/Kino's own camera-follow logic) was overwriting the Transform again before the
+   frame actually rendered. Comparing `cameraWorldPosAfterWrite` frame-to-frame in the next test
+   settles that directly, independent of whatever offset math produced it.
+
+Also worth isolating on the next test: try this in **Photo Mode** specifically rather than while
+actively driving. In free-roam/race, CarX's own camera is already moving and rotating with the
+car, so a real half-meter shift is easy to miss against that - while the same movement is very
+obvious on the dashboard needles, which sit only inches from the lens (parallax makes near
+objects sweep a much bigger angle for the same camera movement than distant ones). Photo Mode's
+camera holds still on its own, which removes that confound entirely.
+
 **0.3.16** - Confirmed v0.3.15's rotation fix worked (log shows `Loading [PhoneCam 0.3.15 ...]`,
 `incomingEuler`/`appliedOffsetEuler` no longer showing the pitch/yaw coupling). This round's ask:
 make sure real-world stepping (e.g. two steps to the right) is actually detected and applied

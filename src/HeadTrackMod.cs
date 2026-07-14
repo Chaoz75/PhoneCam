@@ -22,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.3.16", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.3.17", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.3.16";
+		private const string CurrentVersion = "0.3.17";
 
 		private const int DefaultOscPort = 9000;
 
@@ -62,6 +62,11 @@ namespace HeadTrackARKit {
 		// tracking itself being broken.
 		private Vector3 lastRawArPosition_;
 		private Vector3 lastAppliedPosOffset_;
+
+		// 0.3.17: see the comment at the write site in OnCameraPreCull - ground-truth camera
+		// world position after this mod's own Transform write, for isolating whether an offset
+		// that's computed correctly is actually reaching the Transform this mod controls.
+		private Vector3 lastCameraWorldPosAfterWrite_;
 
 		private Camera cachedCamera_;
 		private float cameraCacheTime_;
@@ -394,6 +399,14 @@ namespace HeadTrackARKit {
 
 				t.position += t.rotation * posOffset;
 				t.rotation = t.rotation * rotOffset;
+
+				// 0.3.17: ground-truth check for the "stepping left does nothing" report - logs
+				// the camera's ACTUAL world position right after this mod wrote to it, so the next
+				// test log shows directly whether the Transform write itself is taking effect, as
+				// opposed to something else (e.g. CarX/Kino's own follow-cam logic) overwriting it
+				// again before the frame actually renders. If this value doesn't move when
+				// appliedPosOffset does, the bug is downstream of this mod, not in the offset math.
+				lastCameraWorldPosAfterWrite_ = t.position;
 			}
 
 			// Rebuild and reassign the view AND projection matrices explicitly, every frame this
@@ -563,6 +576,13 @@ namespace HeadTrackARKit {
 					$"[HeadTrackARKit][diag] incomingPos={FormatVector(lastRawArPosition_)} " +
 					$"appliedPosOffset={FormatVector(lastAppliedPosOffset_)} " +
 					$"maxPositionOffset={config_.MaxPositionOffset:F2} positionSensitivity={config_.PositionSensitivity:F2}");
+				// 0.3.17: ground truth - if this value isn't changing frame to frame while you're
+				// physically stepping side to side, this mod's Transform write isn't the problem;
+				// something else is overwriting the camera afterward. If it IS changing but the
+				// screen doesn't show it, the issue is downstream of this mod entirely (rendering/
+				// camera stacking). Compare consecutive lines of this specifically, not just once.
+				Kino.Log.Info(
+					$"[HeadTrackARKit][diag] cameraWorldPosAfterWrite={FormatVector(lastCameraWorldPosAfterWrite_)}");
 			}
 		}
 
@@ -770,6 +790,23 @@ namespace HeadTrackARKit {
 		}
 
 		private void ApplyDefaultsIfUnset() {
+			// 0.3.17: every real-game log this whole project has ever produced shows
+			// "Unable to save config 'PhoneCam.ksc': System.NullReferenceException" repeating
+			// constantly (every toggle, every slider drag) - which means every settings change
+			// (MaxPositionOffset, PositionSensitivity, InvertPitch/InvertYaw, etc.) has likely
+			// never actually been persisted across a game restart, no matter how many times a
+			// slider got tuned up mid-session. KSL's own save path is obfuscated so the exact
+			// cause can't be read directly, but IHeadTrackConfig's two string properties
+			// (LocalIpOverride, PhoneIpFilter) are the only members here that can default to a
+			// literal null (bool/float/int can't) - and neither was ever explicitly defaulted to
+			// "" the way every numeric setting below is. A null string reaching whatever
+			// (System.String, System.String, System.String) method KSL's save path uses
+			// internally (visible in the log's stack trace) is a very plausible NullReference
+			// source. Defaulting both to "" here costs nothing and directly targets the one gap
+			// left unhandled.
+			if (config_.LocalIpOverride == null) config_.LocalIpOverride = "";
+			if (config_.PhoneIpFilter == null) config_.PhoneIpFilter = "";
+
 			// KSL config properties default to each type's zero value on first run - fill in
 			// sane non-zero defaults the first time this mod loads.
 			if (config_.OscPort <= 0) config_.OscPort = DefaultOscPort;
