@@ -22,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.3.11", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.3.12", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.3.11";
+		private const string CurrentVersion = "0.3.12";
 
 		private const int DefaultOscPort = 9000;
 
@@ -113,6 +113,23 @@ namespace HeadTrackARKit {
 		private readonly List<GameObject> gaugeObjects_ = new List<GameObject>();
 		private bool gaugesHidden_;
 		private float lastGaugeSearchTime_;
+
+		// --- Dashboard gauge-needle diagnostics ---
+		// The hide-workaround above (found via GaugeNameKeywords) turned out to be solving a
+		// different problem than reported: those are MultiHUD's own 2D speedometer HUD objects,
+		// confirmed by MultiHUD's own log ("Found CarX speedometer at: .../UIRaceSpeedometer/
+		// Speedometer") - hiding them stopped THAT from reacting, but the actual complaint is the
+		// physical 3D dashboard gauge needles (visible in the cockpit) spinning/wobbling, only
+		// while PhoneCam is enabled - a completely different object this mod has no visibility
+		// into yet. Rather than guess at another keyword list blind, this is an on-demand scan
+		// (triggered by a button in the settings panel, so it can be run at the exact moment the
+		// wobble is visible) that casts a much wider net and logs each match's full hierarchy path
+		// plus whether a Camera component sits anywhere in its ancestor chain - the single most
+		// useful fact for telling apart "this needle is part of the car's interior model" from
+		// "this needle is parented under the camera rig," which would explain a lot.
+		private static readonly string[] DashboardDiagnosticKeywords = {
+			"speedo", "tach", "rpm", "gauge", "needle", "dash", "cluster", "odometer"
+		};
 
 		// --- In-game updater ---
 		// Checks GitHub Releases directly (not KSL's own updater, which only runs at game
@@ -301,6 +318,54 @@ namespace HeadTrackARKit {
 		}
 
 		/// <summary>
+		/// On-demand diagnostic scan for the dashboard-needle wobble report - see the field comment
+		/// on DashboardDiagnosticKeywords for why this exists as a separate, wider search from the
+		/// HUD-hide one above. Logs every match's full hierarchy path (root-to-leaf) and whether a
+		/// Camera component sits anywhere in its ancestor chain - meant to be run right when the
+		/// wobble is visible in-game, so the resulting log capture is directly correlated with the
+		/// actual symptom instead of being a generic startup dump.
+		/// </summary>
+		private void LogDashboardGaugeDiagnostics() {
+			GameObject[] all = Resources.FindObjectsOfTypeAll<GameObject>();
+			int matchCount = 0;
+
+			Kino.Log.Info("[HeadTrackARKit][dash-diag] Scan starting...");
+
+			foreach (GameObject go in all) {
+				if (!go.scene.IsValid()) continue;
+
+				string lower = go.name.ToLowerInvariant();
+				bool matches = false;
+				foreach (string keyword in DashboardDiagnosticKeywords) {
+					if (lower.Contains(keyword)) {
+						matches = true;
+						break;
+					}
+				}
+				if (!matches) continue;
+
+				matchCount++;
+				if (matchCount > 60) {
+					Kino.Log.Info("[HeadTrackARKit][dash-diag] Stopping early at 60 matches to avoid flooding the log.");
+					break;
+				}
+
+				bool underCamera = false;
+				var pathParts = new List<string> { go.name };
+				Transform t = go.transform.parent;
+				while (t != null) {
+					pathParts.Insert(0, t.name);
+					if (t.GetComponent<Camera>() != null) underCamera = true;
+					t = t.parent;
+				}
+
+				Kino.Log.Info($"[HeadTrackARKit][dash-diag] '{string.Join("/", pathParts)}' underCamera={underCamera}");
+			}
+
+			Kino.Log.Info($"[HeadTrackARKit][dash-diag] Scan complete - {matchCount} candidate object(s) matched.");
+		}
+
+		/// <summary>
 		/// Applies the hidden/shown state to every currently-known gauge object. Only logs on an
 		/// actual state change (not every frame), and re-applies to any newly-found objects even if
 		/// the overall state didn't just change, so an object found mid-session while already
@@ -359,12 +424,17 @@ namespace HeadTrackARKit {
 		/// setting: swap the final offset's pitch (x) and yaw (y) euler components right before
 		/// it's applied to the camera. InvertPitch/InvertYaw are a one-click escape hatch in case
 		/// either direction still ends up backwards after the swap.
+		///
+		/// Takes the raw (pitch, yaw, roll) triple straight from
+		/// HeadTrackState.GetRotationOffsetEuler (atan2-derived, not decomposed from a
+		/// Quaternion) and builds the final applied Quaternion directly from the swapped values -
+		/// see that method's doc comment for why re-decomposing a Quaternion a second time here
+		/// would reintroduce the axis-bleed bug 0.3.12 fixed.
 		/// </summary>
-		private Quaternion FixLookDirection(Quaternion rotOffset) {
-			Vector3 e = rotOffset.eulerAngles;
-			float pitch = NormalizeAngleForLog(e.x);
-			float yaw = NormalizeAngleForLog(e.y);
-			float roll = e.z;
+		private Quaternion FixLookDirection(Vector3 rotOffsetEuler) {
+			float pitch = rotOffsetEuler.x;
+			float yaw = rotOffsetEuler.y;
+			float roll = rotOffsetEuler.z;
 
 			float newPitch = config_.InvertPitch ? -yaw : yaw;
 			float newYaw = config_.InvertYaw ? -pitch : pitch;
@@ -448,7 +518,7 @@ namespace HeadTrackARKit {
 			// exactly like it did before 0.3.7.
 			if (state_.IsCalibrated) {
 				Vector3 posOffset = state_.GetPositionOffset();
-				Quaternion rotOffset = FixLookDirection(state_.GetRotationOffset());
+				Quaternion rotOffset = FixLookDirection(state_.GetRotationOffsetEuler());
 
 				Transform t = cam.transform;
 
@@ -1009,6 +1079,13 @@ namespace HeadTrackARKit {
 			Kino.UI.Label(gaugeObjects_.Count > 0
 				? $"Found {gaugeObjects_.Count} gauge object(s) to hide."
 				: "No gauge object found yet - only searches while this is on and PhoneCam is enabled, so get into a session with the HUD visible first.");
+
+			Kino.UI.Label("If the 3D dashboard gauge needles (not the 2D HUD above) spin/wobble while " +
+				"looking around, that's a different, not-yet-identified object - press this the moment " +
+				"you see it happening, then send the KSL log:");
+			if (Kino.UI.Button("Log dashboard gauge diagnostics")) {
+				LogDashboardGaugeDiagnostics();
+			}
 
 			Kino.UI.HorizontalLine();
 

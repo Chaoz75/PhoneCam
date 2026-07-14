@@ -9,6 +9,32 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.3.12** - 0.3.11's rotation fix (removing the pitch/yaw clamp) wasn't the whole story - a real
+log from testing it caught the actual bug: looking behind you (yaw approaching +-180 degrees) sent
+the camera to "weird angles" rather than continuing to turn smoothly. Root cause: standard XYZ
+Euler-angle decomposition (`Quaternion.eulerAngles`) isn't stable at every orientation, and that
+instability sits right on top of "looking behind you" - a normal, frequent direction, not a rare
+edge case. The log proved it directly: a near-pure yaw turn came back with a huge, spurious roll
+component (`appliedOffsetEuler` jumping to `roll=284` with no actual roll motion happening) -
+rotation was bleeding between axes. Fixed by extracting yaw and pitch directly from the delta
+rotation's forward vector via `atan2` instead of decomposing a full Euler triple - `atan2` has no
+such instability anywhere across the full yaw range, and only degenerates when looking exactly
+straight up or down (a genuinely rare case for a driving camera). `HeadTrackState.GetRotationOffset`
+was restructured into `GetRotationOffsetEuler`, returning the raw (pitch, yaw, roll) numbers
+directly so `HeadTrackMod.FixLookDirection`'s pitch/yaw swap operates on them before they're ever
+assembled into a Quaternion - reassembling and then reading `.eulerAngles` back out a second time
+(what the 0.3.11 version did) would have reintroduced the exact same bleed.
+
+Also this build: the gauge-hide workaround (0.3.10/0.3.11) turned out to be solving a different
+problem than reported - it correctly hides MultiHUD's 2D speedometer HUD, but the actual complaint
+is the 3D dashboard gauge needles (visible in the cockpit) spinning/wobbling, a separate object
+this mod has no visibility into yet. Added a new **"Log dashboard gauge diagnostics"** button in
+the settings panel (next to the existing HUD-hide toggle) - press it the moment the wobble is
+visible in-game, then send the resulting KSL log. It scans for a much wider set of dashboard-
+related object names and logs each match's full hierarchy path plus whether a Camera component
+sits anywhere in its ancestor chain, which should reveal whether the needle is parented under the
+camera rig (a likely explanation) or something else entirely.
+
 **0.3.11** - Two fixes from testing 0.3.10 against a real KSL log:
 - **Gauge-hide workaround (0.3.10) never actually found anything to hide.** The log confirmed it:
   zero "Found N gauge object(s)" lines across a full session, even after MultiHUD itself logged
@@ -475,13 +501,22 @@ libs/                       You put KSL.API.dll / UnityEngine.CoreModule.dll her
   regardless of which scene (or DontDestroyOnLoad) it lives in - see `HeadTrackMod.
   RefreshGaugeObjects`/`SetGaugesHidden`. Trade-off unchanged: gauges aren't visible at all while
   tracking is on, which is why it's a toggle (`HideGaugesWhileTracking`), not a forced behavior.
-- **Rotation was capped well short of a full turn - fixed in 0.3.11.** `MaxRotationOffsetDegrees`
-  was clamping pitch and yaw the same as roll (10-120 degree range), so looking far enough
-  left/right or up/down would just stop instead of continuing to turn with you - noticeable
-  specifically when physically turning your whole body around rather than just your neck.
-  `HeadTrackState.GetRotationOffset()` now only clamps roll; pitch/yaw are unclamped, and
-  `Quaternion.Euler`'s periodic sin/cos construction means that's safe - no discontinuity or
-  wrap-around glitch even well past +-180 degrees on either axis.
+- **Rotation was capped well short of a full turn (0.3.11 fix), then found to still glitch when
+  looking behind you - resolved in 0.3.12.** 0.3.11 removed the pitch/yaw clamp (which was
+  stopping rotation partway through a turn), but real-game testing then caught a second, deeper
+  bug: near yaw=+-180 degrees, decomposing the delta rotation into XYZ Euler angles is inherently
+  unstable, and that instability was bleeding rotation between axes - a pure yaw turn came back
+  with a large, spurious roll value, producing exactly the "camera goes to weird angles" symptom
+  reported. 0.3.12 replaces the Euler decomposition with `atan2` extraction from the delta's
+  forward vector (see `HeadTrackState.GetRotationOffsetEuler`), which has no such instability
+  across the full yaw range - only degenerating when looking exactly straight up/down, a much
+  rarer case for a driving camera than turning around to look behind you.
+- **The "gauges react to camera movement" report turned out to be about the 3D dashboard gauge
+  cluster (the physical needles/dials visible in the cockpit), not MultiHUD's 2D speedometer HUD -
+  still open, needs more diagnosis.** 0.3.10/0.3.11 correctly found and can now hide MultiHUD's UI
+  overlay (`Speedometer`/`SpeedometerBoundings`/`UIRaceSpeedometer`, confirmed via log), but that
+  was solving the wrong problem - the user clarified afterward they meant the in-car dashboard
+  gauges moving, a different object entirely that this mod hasn't investigated yet.
 - **Position tracking range: the "can't walk around" report was a clamp, not a broken pipeline.**
   `HeadTrackState.GetPositionOffset()` was already computing a correct, calibration-relative
   translation delta every frame - `Max position offset` (0.5m default, 1.5m slider ceiling) was

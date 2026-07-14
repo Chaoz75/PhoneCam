@@ -89,26 +89,53 @@ namespace HeadTrackARKit.Tracking {
 		}
 
 		/// <summary>
-		/// Delta rotation relative to the calibrated baseline, sensitivity-scaled. Pitch (x) and
-		/// yaw (y) are intentionally left unclamped as of 0.3.11 - MaxRotationOffsetDegrees no
-		/// longer applies to them at all - so physically turning your whole body all the way around
-		/// keeps rotating the camera continuously instead of stopping partway. This is safe:
-		/// Quaternion.Euler builds its rotation from sin/cos of the given angles, which are
-		/// periodic, so there's no discontinuity or error even as these values grow past +-180 (a
-		/// real 370-degree turn and a 10-degree turn produce the same, correct final orientation).
-		/// Roll (z) still clamps to MaxRotationOffsetDegrees - unlimited roll would let the camera
-		/// corkscrew, which nothing in a real head/body movement would naturally produce.
+		/// Delta rotation relative to the calibrated baseline, sensitivity-scaled, returned as a
+		/// raw (pitch, yaw, roll) triple rather than a Quaternion.
+		///
+		/// 0.3.11 removed the pitch/yaw clamp but kept computing this via
+		/// <c>delta.eulerAngles</c> - real-game testing then showed the actual bug: standard XYZ
+		/// Euler decomposition isn't stable everywhere, and yaw approaching +-180 degrees (i.e.
+		/// looking behind you - an extremely common direction, not an edge case) sits right in an
+		/// unstable region for it. A real log confirmed it directly: a near-pure yaw turn came back
+		/// with a huge, spurious roll component (appliedOffsetEuler jumping to roll=284 with no
+		/// roll motion actually happening) - rotation was "bleeding" between axes exactly where the
+		/// user reported the camera going to "weird angles."
+		///
+		/// Fixed in 0.3.12 by extracting yaw and pitch directly from the delta's forward vector via
+		/// atan2 instead: atan2 has no such instability across the entire yaw range and only
+		/// degenerates when looking exactly straight up or down, a far rarer case for a driving
+		/// camera than "look behind you." Roll is computed separately as whatever twist remains
+		/// after removing yaw/pitch (via LookRotation), which reduces to reading .eulerAngles off a
+		/// quaternion that's mathematically a *pure single-axis rotation* - safe with no instability
+		/// of its own, unlike decomposing the full compound delta rotation directly.
+		///
+		/// Returned as a Vector3, not reassembled into a Quaternion here, specifically so
+		/// HeadTrackMod.FixLookDirection can swap/invert these already-clean pitch/yaw numbers
+		/// directly - reassembling into a Quaternion and then reading .eulerAngles back out a
+		/// second time (as the previous Quaternion-returning version required) would reintroduce
+		/// the exact same decomposition instability this fix removes.
 		/// </summary>
-		public Quaternion GetRotationOffset() {
-			if (!isCalibrated_ || !hasSmoothedSample_) return Quaternion.identity;
+		public Vector3 GetRotationOffsetEuler() {
+			if (!isCalibrated_ || !hasSmoothedSample_) return Vector3.zero;
 
 			Quaternion delta = baseRotationInverse_ * smoothedRotation_;
+			Vector3 fwd = delta * Vector3.forward;
 
-			Vector3 euler = NormalizeEuler(delta.eulerAngles);
-			euler *= RotationSensitivity;
+			float yaw = Mathf.Atan2(fwd.x, fwd.z) * Mathf.Rad2Deg;
+			float horizontalLen = Mathf.Sqrt(fwd.x * fwd.x + fwd.z * fwd.z);
+			float pitch = Mathf.Atan2(-fwd.y, horizontalLen) * Mathf.Rad2Deg;
+
+			// yawPitchOnly points the same direction as delta (same forward vector) with zero
+			// roll by construction (Quaternion.LookRotation always picks the least-rolled
+			// orientation for a given forward+up pair). Subtracting it out of delta leaves a pure
+			// rotation around the shared forward axis - i.e. just the roll, cleanly.
+			Quaternion yawPitchOnly = Quaternion.LookRotation(fwd, Vector3.up);
+			float roll = NormalizeAngle((Quaternion.Inverse(yawPitchOnly) * delta).eulerAngles.z);
+
+			Vector3 euler = new Vector3(pitch, yaw, roll) * RotationSensitivity;
 			euler.z = Mathf.Clamp(euler.z, -MaxRotationOffsetDegrees, MaxRotationOffsetDegrees);
 
-			return Quaternion.Euler(euler);
+			return euler;
 		}
 
 		// Unity's eulerAngles are 0..360 per axis, which makes small negative rotations show up
