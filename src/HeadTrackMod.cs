@@ -22,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.3.8", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.3.9", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.3.8";
+		private const string CurrentVersion = "0.3.9";
 
 		private const int DefaultOscPort = 9000;
 
@@ -46,13 +46,12 @@ namespace HeadTrackARKit {
 		private Quaternion latestArRotation_ = Quaternion.identity;
 
 		// --- Axis-mapping diagnostics ---
-		// The pitch/yaw swap reported after 0.3.7 (mount orientation cycling didn't fix it)
-		// needs real data rather than another guess - these capture the raw incoming ARKit
-		// rotation and the post-mount-correction Unity-space rotation, both as euler angles, so
-		// the periodic heartbeat log (see LogCameraDiagnostics) can print exactly what's coming
-		// in and what correction is currently applied.
+		// Confirms the 0.3.9 pitch/yaw swap fix (see FixLookDirection) is doing what it should,
+		// without needing a full play test - the periodic heartbeat log (see
+		// LogCameraDiagnostics) prints the incoming Unity-space euler angles alongside the final,
+		// post-swap offset actually applied to the camera.
 		private Vector3 lastRawArEuler_;
-		private Vector3 lastCorrectedUnityEuler_;
+		private Vector3 lastAppliedOffsetEuler_;
 
 		private Camera cachedCamera_;
 		private float cameraCacheTime_;
@@ -97,7 +96,10 @@ namespace HeadTrackARKit {
 		// Zoom is a persistent offset added on top of whatever FOV CarX's own camera logic sets
 		// that frame (same "apply after the game" approach as the head-tracking offset itself),
 		// so it composes with any dynamic FOV effects (speed, drift, etc.) instead of fighting them.
-		private float zoomOffsetDegrees_;
+		// zoomTargetDegrees_ is what scroll/keys set directly; zoomCurrentDegrees_ eases toward it
+		// every frame (see Update()) so zoom feels smooth instead of snapping instantly.
+		private float zoomTargetDegrees_;
+		private float zoomCurrentDegrees_;
 
 		// --- In-game updater ---
 		// Checks GitHub Releases directly (not KSL's own updater, which only runs at game
@@ -184,6 +186,14 @@ namespace HeadTrackARKit {
 			if (config_.Enabled && scroll != 0f) {
 				AdjustZoom(-scroll * config_.ZoomSensitivity * 10f);
 			}
+
+			// Ease the applied zoom toward the scroll/key target every frame instead of snapping
+			// straight to it, so zoom feels smooth rather than stepping instantly. Exponential,
+			// frame-rate-independent smoothing: ZoomSmoothing is "how much of the remaining
+			// distance to close per 1/60th of a second," scaled by the actual frame time.
+			float smoothing = Mathf.Clamp01(config_.ZoomSmoothing);
+			float rate = 1f - Mathf.Pow(1f - smoothing, Time.unscaledDeltaTime * 60f);
+			zoomCurrentDegrees_ = Mathf.Lerp(zoomCurrentDegrees_, zoomTargetDegrees_, rate);
 		}
 
 		private void LateUpdate() {
@@ -205,11 +215,11 @@ namespace HeadTrackARKit {
 
 		private void AdjustZoom(float deltaDegrees) {
 			float max = Mathf.Abs(config_.MaxZoomOffset);
-			zoomOffsetDegrees_ = Mathf.Clamp(zoomOffsetDegrees_ + deltaDegrees, -max, max);
+			zoomTargetDegrees_ = Mathf.Clamp(zoomTargetDegrees_ + deltaDegrees, -max, max);
 		}
 
 		private void ResetZoom() {
-			zoomOffsetDegrees_ = 0f;
+			zoomTargetDegrees_ = 0f;
 			Kino.Log.Info("[HeadTrackARKit] Zoom reset.");
 		}
 
@@ -217,8 +227,7 @@ namespace HeadTrackARKit {
 			switch (msg.Address) {
 				case "/lota/camera/position":
 					if (msg.Args.Length >= 3) {
-						Vector3 raw = new Vector3(msg.GetFloat(0), msg.GetFloat(1), msg.GetFloat(2));
-						latestArPosition_ = CorrectMountOrientation(raw);
+						latestArPosition_ = new Vector3(msg.GetFloat(0), msg.GetFloat(1), msg.GetFloat(2));
 						receivedPosition_ = true;
 					}
 					break;
@@ -226,11 +235,7 @@ namespace HeadTrackARKit {
 				case "/lota/camera/rotation":
 					if (msg.Args.Length >= 4) {
 						// LOTA sends quaternion as x, y, z, w.
-						Quaternion raw = new Quaternion(msg.GetFloat(0), msg.GetFloat(1), msg.GetFloat(2), msg.GetFloat(3));
-						Quaternion corrected = CorrectMountOrientation(raw);
-						latestArRotation_ = corrected;
-						lastRawArEuler_ = NormalizeEulerForLog(raw.eulerAngles);
-						lastCorrectedUnityEuler_ = NormalizeEulerForLog(ArKitConversion.ToUnityRotation(corrected).eulerAngles);
+						latestArRotation_ = new Quaternion(msg.GetFloat(0), msg.GetFloat(1), msg.GetFloat(2), msg.GetFloat(3));
 						receivedRotation_ = true;
 					}
 					break;
@@ -244,35 +249,35 @@ namespace HeadTrackARKit {
 				Vector3 unityPos = ArKitConversion.ToUnityPosition(latestArPosition_);
 				Quaternion unityRot = ArKitConversion.ToUnityRotation(latestArRotation_);
 				state_.PushSample(unityPos, unityRot);
+				lastRawArEuler_ = NormalizeEulerForLog(unityRot.eulerAngles);
 			}
 		}
 
 		/// <summary>
-		/// Rotation applied to raw incoming ARKit data (before ArKitConversion touches it) to
-		/// compensate for how the phone happens to be physically mounted relative to the
-		/// orientation LOTA's raw axes assume - see IHeadTrackConfig.MountRollDegrees. 0 is a
-		/// no-op (matches every version before 0.3.7).
+		/// Multiple real-game tests consistently showed a clean pitch/yaw swap: turning your head
+		/// left/right (yaw) moved the in-game camera up/down (pitch), and vice versa. The
+		/// previous "phone mount orientation" cycle (0.3.7/0.3.8) never resolved it, so this
+		/// replaces that with a direct, unconditional fix instead of another cycle-and-hope
+		/// setting: swap the final offset's pitch (x) and yaw (y) euler components right before
+		/// it's applied to the camera. InvertPitch/InvertYaw are a one-click escape hatch in case
+		/// either direction still ends up backwards after the swap.
 		/// </summary>
-		private Quaternion MountCorrection => config_.MountRollDegrees == 0
-			? Quaternion.identity
-			: Quaternion.AngleAxis(config_.MountRollDegrees, Vector3.forward);
+		private Quaternion FixLookDirection(Quaternion rotOffset) {
+			Vector3 e = rotOffset.eulerAngles;
+			float pitch = NormalizeAngleForLog(e.x);
+			float yaw = NormalizeAngleForLog(e.y);
+			float roll = e.z;
 
-		private Vector3 CorrectMountOrientation(Vector3 rawPosition) {
-			if (config_.MountRollDegrees == 0) return rawPosition;
-			return MountCorrection * rawPosition;
-		}
+			float newPitch = config_.InvertPitch ? -yaw : yaw;
+			float newYaw = config_.InvertYaw ? -pitch : pitch;
 
-		private Quaternion CorrectMountOrientation(Quaternion rawRotation) {
-			if (config_.MountRollDegrees == 0) return rawRotation;
-			// Conjugation (C * q * C^-1), not a plain multiply - this is the proper-rotation way
-			// to "relabel" which physical axis means pitch vs yaw vs roll, so it stays correct
-			// for compound head movements too, not just pure up/down or pure left/right.
-			Quaternion c = MountCorrection;
-			return c * rawRotation * Quaternion.Inverse(c);
+			lastAppliedOffsetEuler_ = new Vector3(newPitch, newYaw, roll);
+			return Quaternion.Euler(newPitch, newYaw, roll);
 		}
 
 		// Unity's eulerAngles are 0..360 per axis, which makes small negative rotations show up
-		// as ~359 degrees - remap to -180..180 so the diagnostic log is actually readable.
+		// as ~359 degrees - remap to -180..180 so the diagnostic log (and the swap math above)
+		// is actually readable/correct for small angles.
 		private static Vector3 NormalizeEulerForLog(Vector3 euler) {
 			return new Vector3(NormalizeAngleForLog(euler.x), NormalizeAngleForLog(euler.y), NormalizeAngleForLog(euler.z));
 		}
@@ -327,8 +332,8 @@ namespace HeadTrackARKit {
 			if (cam.targetTexture != null || cam.orthographic) return;
 
 			// Zoom applies independently of head-tracking calibration.
-			if (zoomOffsetDegrees_ != 0f) {
-				cam.fieldOfView = Mathf.Clamp(cam.fieldOfView + zoomOffsetDegrees_, 1f, 179f);
+			if (Mathf.Abs(zoomCurrentDegrees_) > 0.001f) {
+				cam.fieldOfView = Mathf.Clamp(cam.fieldOfView + zoomCurrentDegrees_, 1f, 179f);
 			}
 
 			// 0.3.8: back to writing the head-tracking offset onto the camera's real Transform.
@@ -345,7 +350,7 @@ namespace HeadTrackARKit {
 			// exactly like it did before 0.3.7.
 			if (state_.IsCalibrated) {
 				Vector3 posOffset = state_.GetPositionOffset();
-				Quaternion rotOffset = state_.GetRotationOffset();
+				Quaternion rotOffset = FixLookDirection(state_.GetRotationOffset());
 
 				Transform t = cam.transform;
 
@@ -511,14 +516,13 @@ namespace HeadTrackARKit {
 					$"[HeadTrackARKit][diag] GetActiveCamera() -> {(active != null ? active.name : "null")}, " +
 					$"CameraSwitch.instance found={switchFound}, calibrated={state_.IsCalibrated}, " +
 					$"photoMode={IsInPhotoMode()}");
-				// Axis-mapping diagnostics: raw incoming ARKit euler vs. the post-mount-correction
-				// Unity-space euler, plus the current correction setting - move the phone through
-				// a pure look-left/look-right and a pure look-up/look-down while this is logging
-				// to see exactly which axis LOTA's data actually changes for each movement.
+				// Axis-mapping diagnostics: incoming Unity-space euler (pre-swap) vs. the final
+				// offset actually applied to the camera (post pitch/yaw swap + invert), plus the
+				// current invert settings - confirms FixLookDirection is doing what it should.
 				Kino.Log.Info(
-					$"[HeadTrackARKit][diag] rawArEuler={FormatEuler(lastRawArEuler_)} " +
-					$"correctedUnityEuler={FormatEuler(lastCorrectedUnityEuler_)} " +
-					$"mountRollDegrees={config_.MountRollDegrees}");
+					$"[HeadTrackARKit][diag] incomingEuler={FormatEuler(lastRawArEuler_)} " +
+					$"appliedOffsetEuler={FormatEuler(lastAppliedOffsetEuler_)} " +
+					$"invertPitch={config_.InvertPitch} invertYaw={config_.InvertYaw}");
 			}
 		}
 
@@ -737,6 +741,7 @@ namespace HeadTrackARKit {
 			if (config_.MaxRotationOffset <= 0) config_.MaxRotationOffset = 80f;
 			if (config_.ZoomSensitivity <= 0) config_.ZoomSensitivity = 1.5f;
 			if (config_.MaxZoomOffset <= 0) config_.MaxZoomOffset = 30f;
+			if (config_.ZoomSmoothing <= 0) config_.ZoomSmoothing = 0.2f;
 			if (config_.ClippingGuardMargin <= 0) config_.ClippingGuardMargin = 0.08f;
 			// Layer mask 0 (nothing selected) would make the raycast a no-op; default to "everything"
 			// so the toggle visibly does something the first time it's enabled, and let the user
@@ -859,10 +864,17 @@ namespace HeadTrackARKit {
 			}
 
 			Kino.UI.HorizontalLine();
-			Kino.UI.GroupLabel("Phone mount orientation");
-			Kino.UI.Label("If tilting the phone up/down moves the camera left/right instead of up/down, tap to cycle this.");
-			if (Kino.UI.Button($"Orientation: {config_.MountRollDegrees}° (tap to cycle)")) {
-				config_.MountRollDegrees = (config_.MountRollDegrees + 90) % 360;
+			Kino.UI.GroupLabel("Look direction");
+			Kino.UI.Label("Pitch/yaw are swapped by default to match real-game testing. If a direction still feels backwards, flip it here.");
+
+			bool invertPitch = config_.InvertPitch;
+			if (Kino.UI.Toggle("Invert up/down look", ref invertPitch)) {
+				config_.InvertPitch = invertPitch;
+			}
+
+			bool invertYaw = config_.InvertYaw;
+			if (Kino.UI.Toggle("Invert left/right look", ref invertYaw)) {
+				config_.InvertYaw = invertYaw;
 			}
 
 			Kino.UI.HorizontalLine();
@@ -918,11 +930,16 @@ namespace HeadTrackARKit {
 
 			Kino.UI.HorizontalLine();
 			Kino.UI.GroupLabel("Zoom");
-			Kino.UI.Label($"Current zoom offset: {zoomOffsetDegrees_:F1} deg (mouse wheel, or +/- keys)");
+			Kino.UI.Label($"Current zoom offset: {zoomCurrentDegrees_:F1} deg (target: {zoomTargetDegrees_:F1} deg) - mouse wheel, or +/- keys");
 
 			float zoomSens = config_.ZoomSensitivity;
-			if (Kino.UI.Slider(ref zoomSens, 0.1f, 5f, $"Zoom sensitivity: {zoomSens:F2}")) {
+			if (Kino.UI.Slider(ref zoomSens, 0.1f, 5f, $"Zoom sensitivity (amount per scroll/keypress): {zoomSens:F2}")) {
 				config_.ZoomSensitivity = zoomSens;
+			}
+
+			float zoomSmooth = config_.ZoomSmoothing;
+			if (Kino.UI.Slider(ref zoomSmooth, 0.02f, 1f, $"Zoom smoothing (speed - lower is smoother/slower): {zoomSmooth:F2}")) {
+				config_.ZoomSmoothing = zoomSmooth;
 			}
 
 			float maxZoom = config_.MaxZoomOffset;

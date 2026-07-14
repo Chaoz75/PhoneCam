@@ -36,6 +36,12 @@ namespace HeadTrackARKit {
 		/// <summary>How far the zoom offset can pull the FOV in (negative) or out (positive), in degrees.</summary>
 		float MaxZoomOffset { get; set; }
 
+		/// <summary>
+		/// 0..1 - how quickly the applied zoom eases toward the scroll-wheel/key target each
+		/// frame. Higher = snappier, lower = smoother/slower. Frame-rate independent.
+		/// </summary>
+		float ZoomSmoothing { get; set; }
+
 		// --- Cockpit clipping guard ---
 
 		/// <summary>Master toggle. Off by default - needs the layer mask tuned against the real game first (see README).</summary>
@@ -64,17 +70,19 @@ namespace HeadTrackARKit {
 		/// </summary>
 		string PhoneIpFilter { get; set; }
 
-		// --- Orientation correction ---
+		// --- Look direction fix ---
+		// Replaces the old MountRollDegrees cycle-based correction (removed in 0.3.9) - multiple
+		// real-game tests confirmed a clean, consistent pitch/yaw swap (turning your head
+		// left/right moved the in-game camera up/down, and vice versa) that cycling never
+		// resolved. HeadTrackMod.FixLookDirection now swaps the final offset's pitch/yaw
+		// unconditionally instead, with these two as a quick escape hatch if either direction
+		// still ends up backwards.
 
-		/// <summary>
-		/// Compensates for how the phone is physically mounted relative to what LOTA's raw
-		/// ARKit axes assume - one of 0/90/180/270. If tilting the phone up/down moves the
-		/// camera left/right instead of up/down (a known symptom when the phone ends up
-		/// mounted rotated relative to LOTA's expected orientation), cycle this until up/down
-		/// and left/right map correctly. Applied identically to both the incoming position and
-		/// rotation data, since both come from the same physical mount.
-		/// </summary>
-		int MountRollDegrees { get; set; }
+		/// <summary>Flips the up/down look direction after the pitch/yaw swap.</summary>
+		bool InvertPitch { get; set; }
+
+		/// <summary>Flips the left/right look direction after the pitch/yaw swap.</summary>
+		bool InvertYaw { get; set; }
 
 		// --- Privacy ---
 

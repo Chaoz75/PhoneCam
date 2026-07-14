@@ -9,6 +9,21 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.3.9** - Two fixes from the latest real-game feedback:
+- **Zoom is now smoothed.** Scroll wheel / +/- keys used to snap the FOV offset instantly to its
+  new value; now it eases toward that target every frame (frame-rate independent). A new "Zoom
+  smoothing" slider controls how fast or slow that transition is (lower = smoother/slower,
+  higher = snappier) - separate from "Zoom sensitivity," which still controls how many degrees
+  each scroll notch/keypress adds.
+- **Pitch/yaw swap - fixed directly instead of another mount-orientation guess.** The "Phone
+  mount orientation" cycle button (0.3.7/0.3.8) never resolved the reported "look left moves the
+  camera up, look right moves it down" bug, so it's removed entirely. In its place: the final
+  head-tracking rotation offset's pitch and yaw are now unconditionally swapped right before
+  being applied to the camera - a direct, transparent fix instead of a conjugation-based
+  correction that wasn't working. Two small toggles, "Invert up/down look" and "Invert
+  left/right look," are there as a one-click fix if either direction still ends up backwards
+  after the swap.
+
 **0.3.8** - Real-game test of 0.3.7 surfaced two problems with that build's approach, both
 addressed here:
 - **Zoom silently did nothing to the actual view, even though the gauge HUD visibly reacted to
@@ -383,13 +398,14 @@ libs/                       You put KSL.API.dll / UnityEngine.CoreModule.dll her
   cycle-able "phone mount orientation" setting), the dashboard gauge HUD moving along with the
   head-tracked view (now fixed by never writing to the camera's real Transform, only its render
   matrices), and the camera not reverting when disabled (now explicitly reset).
-- **Phone mount orientation correction (0.3.7) is a manual cycle, not auto-detected, and as of
-  0.3.8 is still unconfirmed to fix the reported pitch/yaw swap.** Cycling through the 4 settings
-  didn't resolve "look left moves the camera up / look right moves it down" in a real-game test.
-  Rather than guess a third value blind, 0.3.8 adds diagnostic logging (raw ARKit euler vs.
-  corrected euler vs. current mount-roll setting, every ~2s) so the next log capture can show
-  exactly which physical movement changes which axis in LOTA's data - this is the next thing to
-  read once that log comes in.
+- **Phone mount orientation cycling (0.3.7/0.3.8) is gone as of 0.3.9 - replaced with a direct
+  fix.** It never resolved the reported "look left moves the camera up / look right moves it
+  down" bug across two real-game tests, so rather than keep guessing at a conjugation-based
+  correction, 0.3.9 unconditionally swaps the final rotation offset's pitch and yaw right before
+  applying it to the camera (see `HeadTrackMod.FixLookDirection`), with "Invert up/down look" and
+  "Invert left/right look" toggles as a one-click correction if either direction is still
+  backwards after the swap. The axis-mapping diagnostic log line is still there (now printing the
+  incoming euler vs. the final post-swap offset) in case another round of tuning is needed.
 - **Kino's Custom Camera mode appears to freeze `Camera.projectionMatrix` independent of
   `fieldOfView`, in addition to freezing `worldToCameraMatrix` (0.3.6).** Real-game evidence: zoom
   visibly changed the gauge HUD's own scaling (which reads `fieldOfView` directly) but never the
