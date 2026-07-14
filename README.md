@@ -9,6 +9,28 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.3.13** - The atan2 rewrite (0.3.12) fixed the axis-bleed bug, but real testing showed the camera
+could *still* flip upside down after a couple of full 360 turns. The 0.3.12 diagnostic log gave a
+direct, concrete answer: `appliedOffsetEuler` hit `x=234` (pitch) during ordinary left/right
+turning. A pitch (rotation around the camera's right/horizontal axis) of that size isn't a glitch -
+it's a literal upside-down camera, and no amount of clean input data changes that; pitch simply
+can't spin through 360 degrees without flipping, only yaw (rotation around up) can. The actual
+cause: `HeadTrackMod.FixLookDirection`'s unconditional pitch/yaw swap (added in 0.3.9) was feeding
+the large, unbounded "turning left/right" value straight into the applied rotation's pitch slot.
+That swap was validated back in 0.3.9 against the *old*, decomposition-unstable rotation extraction
+- it's likely the original "turning left/right moved the camera up/down" symptom it fixed was
+itself partly a side effect of that same instability, not a true, permanent axis mismatch. Now that
+extraction is clean (0.3.12's `atan2` rewrite), the swap is obsolete and was actively causing the
+new flip. **Fixed by removing the swap** - raw pitch and yaw now route straight through to the
+matching camera axis, so unlimited left/right turning stays on the flip-safe yaw axis no matter how
+many times you spin around. `InvertPitch`/`InvertYaw` are unchanged and still available if either
+direction ever reads backwards on your specific rig.
+
+Also confirmed via Q&A: the existing 1:1 position-tracking (`Max position offset`, 0.3.10) already
+applies in every mode including Photo Mode - moving the phone left/right/forward/back moves the
+camera the same amount, up to the configured range. No separate "WASD-style" movement feature was
+needed; this is what was being asked for.
+
 **0.3.12** - 0.3.11's rotation fix (removing the pitch/yaw clamp) wasn't the whole story - a real
 log from testing it caught the actual bug: looking behind you (yaw approaching +-180 degrees) sent
 the camera to "weird angles" rather than continuing to turn smoothly. Root cause: standard XYZ
@@ -501,16 +523,18 @@ libs/                       You put KSL.API.dll / UnityEngine.CoreModule.dll her
   regardless of which scene (or DontDestroyOnLoad) it lives in - see `HeadTrackMod.
   RefreshGaugeObjects`/`SetGaugesHidden`. Trade-off unchanged: gauges aren't visible at all while
   tracking is on, which is why it's a toggle (`HideGaugesWhileTracking`), not a forced behavior.
-- **Rotation was capped well short of a full turn (0.3.11 fix), then found to still glitch when
-  looking behind you - resolved in 0.3.12.** 0.3.11 removed the pitch/yaw clamp (which was
-  stopping rotation partway through a turn), but real-game testing then caught a second, deeper
-  bug: near yaw=+-180 degrees, decomposing the delta rotation into XYZ Euler angles is inherently
-  unstable, and that instability was bleeding rotation between axes - a pure yaw turn came back
-  with a large, spurious roll value, producing exactly the "camera goes to weird angles" symptom
-  reported. 0.3.12 replaces the Euler decomposition with `atan2` extraction from the delta's
-  forward vector (see `HeadTrackState.GetRotationOffsetEuler`), which has no such instability
-  across the full yaw range - only degenerating when looking exactly straight up/down, a much
-  rarer case for a driving camera than turning around to look behind you.
+- **Rotation was capped well short of a full turn (0.3.11), then glitched when looking behind you
+  (0.3.12's atan2 fix), then flipped upside down after a couple of full spins - resolved in
+  0.3.13.** Three layers, each real-game tested: (1) 0.3.11 removed the pitch/yaw clamp that was
+  stopping rotation partway through a turn. (2) 0.3.12 caught a second bug - near yaw=+-180
+  degrees, XYZ Euler decomposition is inherently unstable and was bleeding rotation between axes
+  (a pure yaw turn producing a spurious large roll value) - fixed with `atan2` extraction from the
+  delta's forward vector instead (see `HeadTrackState.GetRotationOffsetEuler`). (3) 0.3.13 found a
+  third, root-cause bug: `HeadTrackMod.FixLookDirection`'s pitch/yaw swap (added 0.3.9, validated
+  against the old unstable extraction) was routing the large, unbounded "turning left/right" value
+  into the applied rotation's *pitch* slot - and a large pitch is a literal upside-down camera,
+  regardless of how clean the input is. Removed the swap; pitch/yaw now route straight through, so
+  unlimited turning stays on the flip-safe yaw axis through any number of full spins.
 - **The "gauges react to camera movement" report turned out to be about the 3D dashboard gauge
   cluster (the physical needles/dials visible in the cockpit), not MultiHUD's 2D speedometer HUD -
   still open, needs more diagnosis.** 0.3.10/0.3.11 correctly found and can now hide MultiHUD's UI

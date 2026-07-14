@@ -22,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.3.12", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.3.13", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.3.12";
+		private const string CurrentVersion = "0.3.13";
 
 		private const int DefaultOscPort = 9000;
 
@@ -46,10 +46,10 @@ namespace HeadTrackARKit {
 		private Quaternion latestArRotation_ = Quaternion.identity;
 
 		// --- Axis-mapping diagnostics ---
-		// Confirms the 0.3.9 pitch/yaw swap fix (see FixLookDirection) is doing what it should,
-		// without needing a full play test - the periodic heartbeat log (see
-		// LogCameraDiagnostics) prints the incoming Unity-space euler angles alongside the final,
-		// post-swap offset actually applied to the camera.
+		// Confirms the direct (no-swap, as of 0.3.13 - see FixLookDirection) pitch/yaw mapping is
+		// doing what it should, without needing a full play test - the periodic heartbeat log (see
+		// LogCameraDiagnostics) prints the incoming Unity-space euler angles alongside the final
+		// offset actually applied to the camera.
 		private Vector3 lastRawArEuler_;
 		private Vector3 lastAppliedOffsetEuler_;
 
@@ -417,35 +417,47 @@ namespace HeadTrackARKit {
 		}
 
 		/// <summary>
-		/// Multiple real-game tests consistently showed a clean pitch/yaw swap: turning your head
-		/// left/right (yaw) moved the in-game camera up/down (pitch), and vice versa. The
-		/// previous "phone mount orientation" cycle (0.3.7/0.3.8) never resolved it, so this
-		/// replaces that with a direct, unconditional fix instead of another cycle-and-hope
-		/// setting: swap the final offset's pitch (x) and yaw (y) euler components right before
-		/// it's applied to the camera. InvertPitch/InvertYaw are a one-click escape hatch in case
-		/// either direction still ends up backwards after the swap.
+		/// 0.3.13: the 0.3.9 pitch/yaw swap is removed here. Real testing after the 0.3.12 atan2
+		/// rewrite pinned down why it's not just unneeded now but actively wrong: a v0.3.12 log
+		/// caught the swap funneling a clean, large yaw value (a normal full-360 turn) straight
+		/// into the *pitch* slot of the applied rotation (appliedOffsetEuler.x=234) - and a
+		/// pitch (rotation around the camera's right axis) of that size isn't a numerical glitch,
+		/// it's a literal upside-down camera. Unlimited spinning can only ever be flip-safe on the
+		/// yaw axis (rotation around up) - pitch geometrically can't do it, no matter how clean the
+		/// input is.
+		///
+		/// The swap was originally validated (0.3.9) against the *old* eulerAngles-based
+		/// extraction, which had its own axis-bleed instability (see
+		/// HeadTrackState.GetRotationOffsetEuler's doc comment) - it's very likely that original
+		/// "turning left/right moved the camera up/down" symptom was itself partly a decomposition
+		/// bleed artifact, and the swap was an empirical fix for *that* data, not a true physical
+		/// axis mismatch. Now that extraction is clean (atan2-based, 0.3.12), routing raw pitch/yaw
+		/// straight through - no swap - is the geometrically correct mapping: yaw (unbounded,
+		/// spin-safe) drives camera yaw, pitch (naturally small, human head-tilt range) drives
+		/// camera pitch. InvertPitch/InvertYaw remain as a one-click escape hatch in case either
+		/// direction reads backwards on this rig.
 		///
 		/// Takes the raw (pitch, yaw, roll) triple straight from
 		/// HeadTrackState.GetRotationOffsetEuler (atan2-derived, not decomposed from a
-		/// Quaternion) and builds the final applied Quaternion directly from the swapped values -
-		/// see that method's doc comment for why re-decomposing a Quaternion a second time here
-		/// would reintroduce the axis-bleed bug 0.3.12 fixed.
+		/// Quaternion) and builds the final applied Quaternion directly - see that method's doc
+		/// comment for why re-decomposing a Quaternion a second time here would reintroduce the
+		/// axis-bleed bug 0.3.12 fixed.
 		/// </summary>
 		private Quaternion FixLookDirection(Vector3 rotOffsetEuler) {
 			float pitch = rotOffsetEuler.x;
 			float yaw = rotOffsetEuler.y;
 			float roll = rotOffsetEuler.z;
 
-			float newPitch = config_.InvertPitch ? -yaw : yaw;
-			float newYaw = config_.InvertYaw ? -pitch : pitch;
+			float newPitch = config_.InvertPitch ? -pitch : pitch;
+			float newYaw = config_.InvertYaw ? -yaw : yaw;
 
 			lastAppliedOffsetEuler_ = new Vector3(newPitch, newYaw, roll);
 			return Quaternion.Euler(newPitch, newYaw, roll);
 		}
 
 		// Unity's eulerAngles are 0..360 per axis, which makes small negative rotations show up
-		// as ~359 degrees - remap to -180..180 so the diagnostic log (and the swap math above)
-		// is actually readable/correct for small angles.
+		// as ~359 degrees - remap to -180..180 so the diagnostic log is actually readable/correct
+		// for small angles.
 		private static Vector3 NormalizeEulerForLog(Vector3 euler) {
 			return new Vector3(NormalizeAngleForLog(euler.x), NormalizeAngleForLog(euler.y), NormalizeAngleForLog(euler.z));
 		}
@@ -684,8 +696,8 @@ namespace HeadTrackARKit {
 					$"[HeadTrackARKit][diag] GetActiveCamera() -> {(active != null ? active.name : "null")}, " +
 					$"CameraSwitch.instance found={switchFound}, calibrated={state_.IsCalibrated}, " +
 					$"photoMode={IsInPhotoMode()}");
-				// Axis-mapping diagnostics: incoming Unity-space euler (pre-swap) vs. the final
-				// offset actually applied to the camera (post pitch/yaw swap + invert), plus the
+				// Axis-mapping diagnostics: incoming Unity-space euler (raw) vs. the final offset
+				// actually applied to the camera (post invert, no swap as of 0.3.13), plus the
 				// current invert settings - confirms FixLookDirection is doing what it should.
 				Kino.Log.Info(
 					$"[HeadTrackARKit][diag] incomingEuler={FormatEuler(lastRawArEuler_)} " +
@@ -1051,7 +1063,7 @@ namespace HeadTrackARKit {
 
 			Kino.UI.HorizontalLine();
 			Kino.UI.GroupLabel("Look direction");
-			Kino.UI.Label("Pitch/yaw are swapped by default to match real-game testing. If a direction still feels backwards, flip it here.");
+			Kino.UI.Label("If up/down or left/right ever feels backwards or reversed, flip it here.");
 
 			bool invertPitch = config_.InvertPitch;
 			if (Kino.UI.Toggle("Invert up/down look", ref invertPitch)) {

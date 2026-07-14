@@ -85,17 +85,19 @@ namespace HeadTrackARKit {
 		string PhoneIpFilter { get; set; }
 
 		// --- Look direction fix ---
-		// Replaces the old MountRollDegrees cycle-based correction (removed in 0.3.9) - multiple
-		// real-game tests confirmed a clean, consistent pitch/yaw swap (turning your head
-		// left/right moved the in-game camera up/down, and vice versa) that cycling never
-		// resolved. HeadTrackMod.FixLookDirection now swaps the final offset's pitch/yaw
-		// unconditionally instead, with these two as a quick escape hatch if either direction
-		// still ends up backwards.
+		// Replaces the old MountRollDegrees cycle-based correction (removed in 0.3.9). 0.3.9 also
+		// added an unconditional pitch/yaw swap here, validated at the time against the old
+		// eulerAngles-based rotation extraction - but a v0.3.12 log caught that swap funneling a
+		// large, clean yaw value (a normal full-360 turn) into the applied rotation's *pitch* slot,
+		// which is what was flipping the camera upside down on full spins. 0.3.13 removed the swap
+		// now that extraction is clean (atan2-based, see HeadTrackState.GetRotationOffsetEuler):
+		// raw pitch/yaw route straight through, unbounded yaw stays flip-safe, and these two remain
+		// as a quick escape hatch if either direction ever reads backwards on this rig.
 
-		/// <summary>Flips the up/down look direction after the pitch/yaw swap.</summary>
+		/// <summary>Flips the up/down look direction.</summary>
 		bool InvertPitch { get; set; }
 
-		/// <summary>Flips the left/right look direction after the pitch/yaw swap.</summary>
+		/// <summary>Flips the left/right look direction.</summary>
 		bool InvertYaw { get; set; }
 
 		// --- Gauge HUD (MultiHUD) conflict workaround ---
