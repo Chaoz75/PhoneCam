@@ -46,5 +46,22 @@ namespace HeadTrackARKit {
 
 		/// <summary>Distance, in meters, kept between the camera and whatever the clipping raycast hits.</summary>
 		float ClippingGuardMargin { get; set; }
+
+		// --- Manual network overrides ---
+
+		/// <summary>
+		/// Manually-entered override for the displayed "this PC's LAN IP" text. Empty means show
+		/// the auto-detected IP instead. Purely informational - the OSC listener always binds to
+		/// all local interfaces regardless of this value, so this only affects what's shown/typed
+		/// into LOTA, not how the mod actually listens.
+		/// </summary>
+		string LocalIpOverride { get; set; }
+
+		/// <summary>
+		/// If set, only OSC packets whose sender IP matches this exact string are accepted -
+		/// anything else hitting the port is silently ignored. Empty (default) accepts from any
+		/// sender, same as before this setting existed.
+		/// </summary>
+		string PhoneIpFilter { get; set; }
 	}
 }

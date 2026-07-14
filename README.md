@@ -7,6 +7,59 @@ depend on the `RealCam ARKit` plugin found in `ModAssetto/` (that file is a sepa
 Assetto Corsa–only plugin and was never opened, run, or decompiled — it's unrelated to this
 mod other than "phone streams ARKit data over OSC" being the same general idea).
 
+## Changelog
+
+**0.3.3** - Adds an in-game updater. New "Update" section at the top of the PhoneCam menu:
+**Check for Update** queries this repo's latest GitHub Release, and if it's newer than the
+installed version, **Download & Install** fetches the `PhoneCam.ksm` asset straight into
+`kino\mods\` - no more manually visiting GitHub and copying the file over. Also wired up (as a
+parallel, no-code-needed path): KSL's own built-in Automatic updater, same mechanism your other
+mods already use. Important caveat either way: a game restart is still required to actually load
+the new code - see "Publishing an update" above for why, and for the release-publishing steps
+this depends on.
+
+**0.3.2** - Diagnostic build, round 2. The 0.3.1 log capture showed *zero* `[diag]` lines despite
+a full play session (car loaded, camera modes engaged, calibration re-run several times) - that's
+ambiguous, since 0.3.1 only logged diagnostics while the Enabled toggle was on. This build removes
+that gate so `LogCameraDiagnostics` always runs off `Camera.onPreCull`, regardless of Enabled, so
+the next log will show definitively whether `onPreCull` ever fires at all for Kino's custom camera.
+Also added: a log line whenever the Enabled toggle is flipped from the settings panel, and the
+startup log now states the Enabled state it loaded with, so a log dump gives a clear timeline of
+what was actually on/off during a test session.
+
+**0.3.1** - Diagnostic build. Tracking still didn't move the camera in testing even after 0.3.0's
+`CameraSwitch` fix, and the KSL log showed Kino's own camera system (`kino.dll`) is active
+("Custom camera set to True") - a separate system from anything in `Assembly-CSharp.dll`.
+`kino.dll` has no readable .NET metadata (confirmed obfuscated), so it can't be inspected the
+same way. This build adds logging instead of another guess: every distinct camera Unity
+actually renders through gets logged once (see `LogCameraDiagnostics` in `HeadTrackMod.cs`),
+plus a heartbeat every ~2s showing what `GetActiveCamera()` currently resolves to. The next
+`kino/output.log` capture should show exactly which camera is real, so the fix can target it
+directly instead of guessing again.
+
+**0.3.0**
+- Fixed: tracking could fail to move the camera in modes other than Photo Mode too. CarX turns
+  out to manage cockpit/follow/rear/static/replay/photo cameras through its own public
+  `CameraSwitch` singleton (confirmed via `Assembly-CSharp.dll`) rather than relying on Unity's
+  `MainCamera` tag consistently. `GetActiveCamera()` now asks `CameraSwitch.instance.FindActiveCamera()`
+  first (works for every mode CarX itself tracks), falls back to the Photo-Mode-specific fix
+  from 0.2.0, then to `Camera.main` as a last resort. See "Known limitations" for the full
+  writeup.
+- Added: the PC LAN IP field is now editable (persisted) in case auto-detect picks the wrong
+  network adapter - "Refresh IP" goes back to auto-detect.
+- Added: an optional "Phone's IP" field - when set, the mod only accepts OSC packets from that
+  exact address, ignoring anything else hitting the port.
+
+**0.2.0**
+- Fixed: head tracking did nothing while in Photo Mode - it uses its own dedicated camera,
+  separate from `Camera.main` (see "Known limitations" below for the full explanation).
+- Added: the mod's settings panel now shows this PC's LAN IP (with a Refresh button) and the
+  last OSC sender's IP, so pointing LOTA at the right address is easier and verifiable.
+- Added: a "Calibrated: yes/no" status label so it's unambiguous whether F9 has been pressed.
+
+**0.1.0** - Initial release: head tracking, zoom/FOV control, cockpit clipping guard,
+Photo-Mode-gated "How to use" help panel.
+
 ## How it works
 
 1. **LOTA** (free, official App Store app, no subscription) runs on your iPhone and streams
@@ -37,11 +90,9 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 - [LOTA — LiDAR Over the Air](https://apps.apple.com/app/id6760984302) installed on the phone.
 - CarX Drift Racing Online with [KSL](https://github.com/trbflxr/ksl) installed (the current
   community mod loader for this game — see their install guide).
-- Windows PC with the .NET SDK (or Visual Studio / Rider) to build this project. **Building
-  has to happen on your own machine** — it needs `KSL.API.dll` and
-  `UnityEngine.CoreModule.dll` copied out of your actual CarX install, which obviously isn't
-  available in this sandboxed environment. Everything in this repo has been written and
-  logic-checked here, but not yet compiled or run against the real game.
+- Windows PC with the .NET SDK (or Visual Studio / Rider) to build this project. Building
+  has to happen on your own machine — it needs `KSL.API.dll` and
+  `UnityEngine.CoreModule.dll` copied out of your actual CarX install.
 
 ## Build
 
@@ -54,6 +105,8 @@ Adjust the path below to match your own install.
    - `UnityEngine.CoreModule.dll`
    - `UnityEngine.PhysicsModule.dll` (used by the cockpit clipping guard's raycasts)
    - `UnityEngine.InputLegacyModule.dll` (used by `UnityEngine.Input` for scroll-wheel zoom)
+   - `UnityEngine.UnityWebRequestModule.dll` (used by the in-game update checker)
+   - `UnityEngine.JSONSerializeModule.dll` (used to parse GitHub's release response)
    - `Assembly-CSharp.dll` (the game's own code - used for the `UIPhotoModeContext` Photo Mode check, see below)
 
    into this project's `libs\` folder (create it if it doesn't exist).
@@ -77,19 +130,60 @@ Adjust the path below to match your own install.
 5. That's it — no manual copy step needed anymore. `kino\mods\` already held several other raw
    `.dll` mods and `.ksm` packages before this one, confirming KSL loads straight from there.
 
+## Publishing an update (so the in-game updater / KSL's own updater can find it)
+
+The mod's signing key (`PhoneCam_maykr.kmc`) lives only on your PC and should never be uploaded
+anywhere, so GitHub can't build/sign releases itself — the signed `.ksm` always has to be built
+locally first, same as above. Once you have it:
+
+1. Build normally (`dotnet build -c Release`) — this drops a freshly-signed `PhoneCam.ksm` into
+   `<CarX install>\kino\mods\`.
+2. On GitHub, go to `https://github.com/Chaoz75/PhoneCam` → **Releases** → **Draft a new
+   release**.
+3. **Tag**: match the version you just bumped in `HeadTrackMod.cs` (both the `KSLMeta` attribute
+   and the `CurrentVersion` const), prefixed with `v` — e.g. `v0.3.3`.
+4. **Title**: whatever's clear to you, e.g. `v0.3.3`.
+5. Drag in the built `PhoneCam.ksm` (from `<CarX install>\kino\mods\PhoneCam.ksm`) as a release
+   asset. The filename must stay exactly `PhoneCam.ksm` — that's what both updaters look for.
+6. Click **Publish release**.
+
+That's the only manual step per version — from there:
+- **In-game updater**: open the PhoneCam menu → **Check for Update** → **Download & Install**
+  fetches that release's `PhoneCam.ksm` straight into `kino\mods\`, no browser needed. A restart
+  is still required to actually load the new code (see note below).
+- **KSL's own updater**: if PhoneCam's Updater type is set to **Automatic** in KSL's Control
+  Panel (linked to this GitHub repo), it self-updates the same way automatically at the next
+  game launch, with no button-clicking needed at all.
+
+**Neither of these can apply an update without a restart.** Once a mod's compiled code is loaded
+into the running game process, there's no supported way in Mono/.NET (or Unity generally) to
+unload and reload just that one assembly — every other KSL/BepInEx mod you have installed has
+this same limitation. What both updaters *do* remove is the manual "find the file on GitHub,
+download it, copy it into `kino\mods`" busywork — the new version is just sitting there ready
+the next time you happen to restart anyway.
+
 ## Using it
 
-1. On your iPhone, open LOTA. Stay on the main camera page (any mode except **Motion** —
+1. In CarX, open the mod's settings (via KSL's mod menu) first and note **"This PC's LAN IP"**
+   shown there. It's auto-detected but editable — if it picked the wrong network adapter (e.g.
+   a VPN's virtual adapter instead of your real Wi-Fi), just type the correct one in; **Refresh
+   IP** re-runs auto-detection. There's also an optional **"Phone's IP"** field — leave it blank
+   to accept data from any device, or fill in your phone's IP to have the mod ignore anything
+   else that happens to hit the port.
+2. On your iPhone, open LOTA. Stay on the main camera page (any mode except **Motion** —
    camera-pose OSC is deliberately suppressed in Motion mode). Tap the status bar pill to
-   open **Transmission Settings**, enable **OSC**, set the destination IP to your PC's LAN
-   address and the port to match this mod's (default `9000`, changeable in the mod's
-   settings panel in-game). Make sure the phone and PC are on the same Wi-Fi network.
-2. Tap the shutter with **STREAM** selected to start streaming.
-3. In CarX, open the mod's settings (via KSL's mod menu) and confirm "Status: receiving
-   data."
-4. Sit in your normal driving position, holding the phone facing you (or mounted), then press
-   **F9** to set neutral. Re-press it any time you shift position.
-5. Tune position/rotation sensitivity, smoothing, and the safety clamps (max offset) from the
+   open **Transmission Settings**, enable **OSC**, and type in the IP from step 1 and the port
+   shown in the mod's settings (default `9000`, changeable there). Make sure the phone and PC
+   are on the same Wi-Fi network.
+3. Tap the shutter with **STREAM** selected to start streaming.
+4. Back in CarX's mod settings, confirm **"Status: receiving data"** — the panel also shows
+   **"Last sender IP"** once a packet arrives, so you can double check it's actually your phone
+   and not some other device on the network hitting that port.
+5. Sit in your normal driving position, holding the phone facing you (or mounted), then press
+   **F9** to set neutral. The panel shows **"Calibrated: yes/no"** so it's obvious whether this
+   step has actually happened — nothing moves until it says yes. Re-press F9 any time you shift
+   position.
+6. Tune position/rotation sensitivity, smoothing, and the safety clamps (max offset) from the
    in-game settings panel to taste.
 
 ### Controls (all rebindable via KSL's own hotkey settings)
@@ -141,22 +235,29 @@ libs/                       You put KSL.API.dll / UnityEngine.CoreModule.dll her
 
 ## Known limitations / next steps
 
-- **Not yet compiled against the real game.** The OSC wire-format parsing was verified
-  independently (byte-for-byte logic check, see chat history), but `HeadTrackMod.cs` itself
-  has not been built or run inside CarX yet, since that requires Windows + your actual game
-  files. If you hit build errors after adding the real `KSL.API.dll`, they're likely small
-  API-shape mismatches (KSL's exact method signatures were sourced from their public docs,
-  not from a downloaded SDK) — send me the compiler errors and I'll fix them.
-- **`Camera.onPreCull` targets `Camera.main`**, i.e. whatever camera is tagged `MainCamera`
-  in the scene — Unity's default for a game's primary camera. If CarX's in-car camera isn't
-  tagged that way, the hook won't find it. If you share your CarX install folder (or just
-  `Assembly-CSharp.dll` from its `Managed` folder), I can inspect the actual camera
-  controller and wire this up precisely instead of relying on the tag convention.
+- **CarX manages cameras through its own `CameraSwitch` system, not Unity's `MainCamera` tag.**
+  Confirmed by directly inspecting `Assembly-CSharp.dll`'s metadata:
+  - `UIPhotoModeContext` holds a private `m_camera` field (type `UnityEngine.Camera`, driven
+    internally by a `CinemachineVirtualCamera`) that's a separate object from whatever's tagged
+    `MainCamera`.
+  - More broadly, `CameraSwitch` (a public singleton, `CameraSwitch.instance`) is CarX's own
+    manager for every camera mode - its `ECameraType` enum lists Race, Follow, Replay, and
+    PhotoSession, and its public `FindActiveCamera()` method returns whichever
+    `CarX.BaseCamera`-derived controller (`CockpitCamera`, `FollowCamera`, `RearCamera`,
+    `StaticCamera`, etc.) is currently active. Since `BaseCamera` extends `MonoBehaviour`, the
+    real `Camera` component sits on the same GameObject.
+
+  `HeadTrackMod.GetActiveCamera()` now resolves the target camera in three layers:
+  `CameraSwitch.instance.FindActiveCamera()` first (covers every mode CarX itself tracks, no
+  reflection needed since everything involved is public), then the Photo-Mode-specific
+  reflection fix as a fallback, then `Camera.main` as a last resort. This should cover cockpit,
+  follow/hood, rear, static, replay, and photo modes - but since none of this has been run
+  against the real game yet from this end, if any mode still doesn't move the camera, that's
+  the next thing to report back with (which mode, and whether "Calibrated: yes" was showing).
 - The zoom offset and head-tracking offset both add on top of whatever CarX outputs that
   frame (including its own shake/FOV effects) rather than replacing it — this is deliberate,
   but means extreme zoom + a game effect that also changes FOV heavily could stack oddly.
-  Worth a look once you can test in-game.
 - **Cockpit clipping guard is unverified against real geometry.** The raycast logic itself is
   straightforward Unity `Physics.Raycast`, but which layer(s) CarX's cockpit/interior
-  collision lives on isn't something I could determine without the game running. Leave it
-  off until you've tried it, then narrow the layer mask down from "everything."
+  collision lives on isn't something confirmed against the real game yet. Leave it off until
+  you've tried it, then narrow the layer mask down from "everything."

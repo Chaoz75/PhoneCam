@@ -1,8 +1,15 @@
 using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
+using System.Reflection;
 using HeadTrackARKit.Osc;
 using HeadTrackARKit.Tracking;
 using KSL.API;
 using UnityEngine;
+using UnityEngine.Networking;
 
 namespace HeadTrackARKit {
 	/// <summary>
@@ -14,8 +21,15 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.1.0", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.3.3", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
+		// IMPORTANT: bump this together with the KSLMeta version string right above, every
+		// release - this is what the in-game updater compares against GitHub's latest release
+		// tag to decide whether an update is available. There's no confirmed public way to read
+		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
+		// rather than guessed at via reflection into an undocumented attribute shape.
+		private const string CurrentVersion = "0.3.3";
+
 		private const int DefaultOscPort = 9000;
 
 		private readonly OscUdpReceiver receiver_ = new OscUdpReceiver();
@@ -39,10 +53,71 @@ namespace HeadTrackARKit {
 		// reflects CarX's own UI context stack switching Photo Mode on/off.
 		private UIPhotoModeContext photoModeContext_;
 
+		// Photo Mode drives its own dedicated Camera (privately held, backed by a
+		// CinemachineVirtualCamera under the hood) that is NOT the camera tagged "MainCamera" -
+		// confirmed by directly inspecting Assembly-CSharp.dll's field table for
+		// UIPhotoModeContext (field "m_camera", type UnityEngine.Camera). That's why tracking
+		// previously did nothing while in Photo Mode: Camera.main never matched the camera
+		// actually rendering. There's no public accessor for it, so this reads the one field
+		// reference via reflection - it doesn't touch or copy any of the game's own logic, just
+		// locates which live Camera object to apply our offset to.
+		private static readonly FieldInfo PhotoModeCameraField =
+			typeof(UIPhotoModeContext).GetField("m_camera", BindingFlags.NonPublic | BindingFlags.Instance);
+
+		// This PC's own LAN IPv4 address(es), shown in the settings panel so LOTA's destination
+		// IP can be copied over at a glance instead of hunting for it via ipconfig. Editable -
+		// see config_.LocalIpOverride - since auto-detection can't always guess which adapter
+		// (Wi-Fi vs Ethernet vs a VPN's virtual adapter) is the right one to type into LOTA.
+		private string localIpText_ = "(not checked yet)";
+
+		// Manually-entered phone IP, used to filter incoming OSC packets - see
+		// config_.PhoneIpFilter and OscUdpReceiver.AllowedSenderFilter. Empty = accept from any sender.
+		private string phoneIpText_ = "";
+
+		// --- Diagnostics ---
+		// Since Kino's own camera system (kino.dll) is obfuscated and can't be inspected the way
+		// Assembly-CSharp was, guessing at another fix isn't productive right now. This logs
+		// ground-truth info into KSL's log instead: every distinct camera Unity actually renders
+		// through each frame (once each, so it doesn't spam), plus a periodic heartbeat showing
+		// what GetActiveCamera() currently resolves to. Whatever the next log dump shows will
+		// point at the real camera to target, rather than another guess.
+		private readonly HashSet<string> loggedCameraNames_ = new HashSet<string>();
+		private float lastDiagnosticLogTime_;
+
 		// Zoom is a persistent offset added on top of whatever FOV CarX's own camera logic sets
 		// that frame (same "apply after the game" approach as the head-tracking offset itself),
 		// so it composes with any dynamic FOV effects (speed, drift, etc.) instead of fighting them.
 		private float zoomOffsetDegrees_;
+
+		// --- In-game updater ---
+		// Checks GitHub Releases directly (not KSL's own updater, which only runs at game
+		// startup) so a newer build can be fetched into kino/mods without closing the game.
+		// NOTE: this can never hot-swap the *running* code - once a .NET assembly is loaded into
+		// a live process there's no supported way to reload it, in Unity/Mono or otherwise. What
+		// this does do is remove the manual "go to GitHub, download, copy the file over" steps -
+		// the downloaded .ksm is ready and waiting the next time the game happens to restart.
+		private const string UpdateRepoOwner = "Chaoz75";
+		private const string UpdateRepoName = "PhoneCam";
+		private const string UpdateCheckUrl = "https://api.github.com/repos/" + UpdateRepoOwner + "/" + UpdateRepoName + "/releases/latest";
+		private const string UpdateAssetName = "PhoneCam.ksm";
+
+		private string updateStatus_ = "Not checked yet.";
+		private string updateLatestVersion_;
+		private string updateDownloadUrl_;
+		private bool updateCheckInProgress_;
+		private bool updateDownloadInProgress_;
+
+		[Serializable]
+		private class GitHubAsset {
+			public string name;
+			public string browser_download_url;
+		}
+
+		[Serializable]
+		private class GitHubRelease {
+			public string tag_name;
+			public GitHubAsset[] assets;
+		}
 
 		private void Start() {
 			config_ = Kino.Config.RegisterConfig<IHeadTrackConfig>();
@@ -59,13 +134,18 @@ namespace HeadTrackARKit {
 
 			receiver_.OnError += ex => Kino.Log.Warning($"[HeadTrackARKit] OSC receive error: {ex.Message}");
 
+			localIpText_ = string.IsNullOrEmpty(config_.LocalIpOverride) ? AutoDetectLocalIp() : config_.LocalIpOverride;
+
+			phoneIpText_ = config_.PhoneIpFilter ?? "";
+			receiver_.AllowedSenderFilter = phoneIpText_;
+
 			if (config_.Enabled) {
 				StartReceiver();
 			}
 
 			Camera.onPreCull += OnCameraPreCull;
 
-			Kino.Log.Info("[HeadTrackARKit] Loaded. Bind key default: F9 to calibrate neutral position.");
+			Kino.Log.Info($"[HeadTrackARKit] Loaded. Enabled={config_.Enabled}. Bind key default: F9 to calibrate neutral position.");
 		}
 
 		private void OnDestroy() {
@@ -135,8 +215,15 @@ namespace HeadTrackARKit {
 		}
 
 		private void OnCameraPreCull(Camera cam) {
+			// Runs regardless of the Enabled toggle now - the previous diagnostic build (0.3.1)
+			// gated this on config_.Enabled and came back with zero diag lines even after a full
+			// play session, which was ambiguous: either Enabled was actually off, or onPreCull
+			// never fires for whatever camera Kino's custom camera system uses. Logging
+			// unconditionally settles which one it is.
+			LogCameraDiagnostics(cam);
+
 			if (!config_.Enabled) return;
-			if (cam != GetMainCamera()) return;
+			if (cam != GetActiveCamera()) return;
 
 			// Zoom applies independently of head-tracking calibration.
 			if (zoomOffsetDegrees_ != 0f) {
@@ -188,6 +275,79 @@ namespace HeadTrackARKit {
 			return localPosOffset;
 		}
 
+		/// <summary>
+		/// The camera to apply the head-track/zoom offset to this frame, resolved in three
+		/// layers so it works across every camera mode CarX has, not just whichever one happens
+		/// to be tagged "MainCamera":
+		///
+		/// 1. <c>CameraSwitch.instance.FindActiveCamera()</c> - confirmed via direct inspection
+		///    of Assembly-CSharp.dll's metadata: <c>CameraSwitch</c> is CarX's own public
+		///    singleton manager for every camera mode (its <c>ECameraType</c> enum literally
+		///    lists Race, Follow, Replay, and PhotoSession), and <c>FindActiveCamera()</c> is a
+		///    public method that returns whichever <c>CarX.BaseCamera</c>-derived controller is
+		///    currently active. <c>BaseCamera</c> itself extends <c>UnityEngine.MonoBehaviour</c>
+		///    (also confirmed via the assembly), so the actual render <c>Camera</c> component
+		///    sits on the same GameObject - reachable with a plain <c>GetComponent&lt;Camera&gt;()</c>,
+		///    no reflection needed since both types and members involved are public.
+		/// 2. The previous Photo-Mode-specific fallback (reflecting into
+		///    <c>UIPhotoModeContext.m_camera</c>) - kept in case CameraSwitch ever doesn't cover
+		///    Photo Mode's camera for some reason.
+		/// 3. <c>Camera.main</c> - last-resort fallback if both of the above come back null,
+		///    e.g. before any camera has been set up yet (main menu, loading).
+		/// </summary>
+		private Camera GetActiveCamera() {
+			CameraSwitch cameraSwitch = CameraSwitch.instance;
+			if (cameraSwitch != null) {
+				CarX.BaseCamera active = cameraSwitch.FindActiveCamera();
+				if (active != null) {
+					Camera cam = active.GetComponent<Camera>();
+					if (cam != null) return cam;
+				}
+			}
+
+			if (IsInPhotoMode() && PhotoModeCameraField != null) {
+				if (PhotoModeCameraField.GetValue(photoModeContext_) is Camera photoCam && photoCam != null) {
+					return photoCam;
+				}
+			}
+
+			return GetMainCamera();
+		}
+
+		/// <summary>
+		/// Logs ground-truth data about what's actually rendering, since Kino's own camera
+		/// system (kino.dll) can't be statically inspected (no readable .NET metadata - it's
+		/// obfuscated). Two things get logged to KSL's log:
+		/// 1. Every distinct camera name Unity calls OnPreCull for, the first time it's seen
+		///    (deduped by name so this doesn't spam every frame), tagged with whether
+		///    GetActiveCamera() currently considers it "the" active one.
+		/// 2. Every ~2 seconds, a heartbeat line showing what GetActiveCamera() resolves to by
+		///    name (or "null"), whether CameraSwitch.instance itself was found at all, and the
+		///    current calibrated/enabled state - so log timestamps can be matched up against
+		///    when you were actually moving your head in-game.
+		/// </summary>
+		private void LogCameraDiagnostics(Camera cam) {
+			if (cam == null) return;
+
+			if (loggedCameraNames_.Add(cam.name)) {
+				Camera active = GetActiveCamera();
+				Kino.Log.Info(
+					$"[HeadTrackARKit][diag] Camera seen: '{cam.name}' tag={cam.tag} " +
+					$"targetTexture={(cam.targetTexture != null ? "yes" : "no")} " +
+					$"depth={cam.depth} isResolvedActive={cam == active}");
+			}
+
+			if (Time.unscaledTime - lastDiagnosticLogTime_ > 2f) {
+				lastDiagnosticLogTime_ = Time.unscaledTime;
+				Camera active = GetActiveCamera();
+				bool switchFound = CameraSwitch.instance != null;
+				Kino.Log.Info(
+					$"[HeadTrackARKit][diag] GetActiveCamera() -> {(active != null ? active.name : "null")}, " +
+					$"CameraSwitch.instance found={switchFound}, calibrated={state_.IsCalibrated}, " +
+					$"photoMode={IsInPhotoMode()}");
+			}
+		}
+
 		private bool IsInPhotoMode() {
 			if (photoModeContext_ == null) {
 				// FindAnyObjectByType, not FindFirstObjectByType - we don't care which instance,
@@ -208,6 +368,168 @@ namespace HeadTrackARKit {
 			cachedCamera_ = Camera.main;
 			cameraCacheTime_ = Time.unscaledTime;
 			return cachedCamera_;
+		}
+
+		/// <summary>
+		/// Enumerates this PC's active, non-loopback IPv4 addresses (one per network adapter,
+		/// e.g. Wi-Fi and Ethernet both show up if both are connected) - that's what needs typing
+		/// into LOTA's Transmission Settings destination IP field. Purely for display; the OSC
+		/// listener itself binds to all interfaces (IPAddress.Any) regardless of this value.
+		/// </summary>
+		private static string AutoDetectLocalIp() {
+			try {
+				var addresses = new List<string>();
+				foreach (NetworkInterface ni in NetworkInterface.GetAllNetworkInterfaces()) {
+					if (ni.OperationalStatus != OperationalStatus.Up) continue;
+					if (ni.NetworkInterfaceType == NetworkInterfaceType.Loopback) continue;
+
+					foreach (UnicastIPAddressInformation addr in ni.GetIPProperties().UnicastAddresses) {
+						if (addr.Address.AddressFamily == AddressFamily.InterNetwork) {
+							addresses.Add(addr.Address.ToString());
+						}
+					}
+				}
+
+				return addresses.Count > 0
+					? string.Join(", ", addresses)
+					: "(no active network adapter found)";
+			}
+			catch (Exception ex) {
+				return $"(couldn't detect IP: {ex.Message})";
+			}
+		}
+
+		/// <summary>Re-runs auto-detection and clears any manual override, going back to "auto" mode.</summary>
+		private void RefreshLocalIp() {
+			config_.LocalIpOverride = "";
+			localIpText_ = AutoDetectLocalIp();
+		}
+
+		private void CheckForUpdate() {
+			if (updateCheckInProgress_) return;
+			updateCheckInProgress_ = true;
+			updateDownloadUrl_ = null;
+			updateStatus_ = "Checking GitHub...";
+			StartCoroutine(CheckForUpdateCoroutine());
+		}
+
+		private IEnumerator CheckForUpdateCoroutine() {
+			using (UnityWebRequest req = UnityWebRequest.Get(UpdateCheckUrl)) {
+				// GitHub's API rejects requests with no User-Agent header.
+				req.SetRequestHeader("User-Agent", "PhoneCam-KSL-Mod");
+				yield return req.SendWebRequest();
+
+				updateCheckInProgress_ = false;
+
+				if (req.responseCode == 404) {
+					updateStatus_ = $"No releases published yet on github.com/{UpdateRepoOwner}/{UpdateRepoName}.";
+					yield break;
+				}
+
+				if (req.result != UnityWebRequest.Result.Success) {
+					updateStatus_ = $"Check failed: {req.error}";
+					yield break;
+				}
+
+				GitHubRelease release;
+				try {
+					release = JsonUtility.FromJson<GitHubRelease>(req.downloadHandler.text);
+				}
+				catch (Exception ex) {
+					updateStatus_ = $"Check failed: couldn't parse GitHub's response ({ex.Message}).";
+					yield break;
+				}
+
+				if (release == null || string.IsNullOrEmpty(release.tag_name)) {
+					updateStatus_ = "Check failed: unexpected response from GitHub.";
+					yield break;
+				}
+
+				string latest = release.tag_name.TrimStart('v', 'V');
+				updateLatestVersion_ = latest;
+
+				GitHubAsset asset = null;
+				if (release.assets != null) {
+					foreach (GitHubAsset a in release.assets) {
+						if (string.Equals(a.name, UpdateAssetName, StringComparison.OrdinalIgnoreCase)) {
+							asset = a;
+							break;
+						}
+					}
+				}
+
+				bool isNewer;
+				try {
+					isNewer = new Version(latest) > new Version(CurrentVersion);
+				}
+				catch {
+					// Tag doesn't parse as a clean major.minor(.build) version - fall back to a
+					// plain string comparison so this doesn't hard-fail on an unusual tag name.
+					isNewer = !string.Equals(latest, CurrentVersion, StringComparison.OrdinalIgnoreCase);
+				}
+
+				if (!isNewer) {
+					updateStatus_ = $"Up to date (v{CurrentVersion}).";
+				}
+				else if (asset == null) {
+					updateStatus_ = $"v{latest} is out on GitHub, but no '{UpdateAssetName}' file is attached to that release.";
+				}
+				else {
+					updateStatus_ = $"Update available: v{latest} (you have v{CurrentVersion}).";
+					updateDownloadUrl_ = asset.browser_download_url;
+				}
+			}
+		}
+
+		private void DownloadUpdate() {
+			if (updateDownloadInProgress_ || string.IsNullOrEmpty(updateDownloadUrl_)) return;
+			updateDownloadInProgress_ = true;
+			updateStatus_ = "Downloading...";
+			StartCoroutine(DownloadUpdateCoroutine(updateDownloadUrl_));
+		}
+
+		private IEnumerator DownloadUpdateCoroutine(string url) {
+			using (UnityWebRequest req = UnityWebRequest.Get(url)) {
+				req.SetRequestHeader("User-Agent", "PhoneCam-KSL-Mod");
+				yield return req.SendWebRequest();
+
+				updateDownloadInProgress_ = false;
+
+				if (req.result != UnityWebRequest.Result.Success) {
+					updateStatus_ = $"Download failed: {req.error}";
+					yield break;
+				}
+
+				try {
+					string modsDir = GetModsDirectory();
+					string finalPath = Path.Combine(modsDir, UpdateAssetName);
+					string tempPath = finalPath + ".download";
+
+					File.WriteAllBytes(tempPath, req.downloadHandler.data);
+
+					if (File.Exists(finalPath)) {
+						File.Delete(finalPath);
+					}
+					File.Move(tempPath, finalPath);
+
+					Kino.Log.Info($"[HeadTrackARKit] Downloaded update v{updateLatestVersion_} to '{finalPath}'.");
+					updateStatus_ = $"Downloaded v{updateLatestVersion_}. Restart the game to finish updating.";
+					updateDownloadUrl_ = null;
+				}
+				catch (Exception ex) {
+					updateStatus_ = $"Download failed: couldn't save the file ({ex.Message}).";
+				}
+			}
+		}
+
+		/// <summary>
+		/// kino/mods sits as a sibling of Unity's own "&lt;Product&gt;_Data" folder - matches the
+		/// exact path KSL itself logs while scanning for mods at startup, so this is derived from
+		/// Application.dataPath rather than hardcoding this PC's install path.
+		/// </summary>
+		private static string GetModsDirectory() {
+			string gameRoot = Directory.GetParent(Application.dataPath).FullName;
+			return Path.Combine(Path.Combine(gameRoot, "kino"), "mods");
 		}
 
 		private void StartReceiver() {
@@ -256,6 +578,27 @@ namespace HeadTrackARKit {
 			Kino.UI.Label("LOTA - LiDAR Over the Air (free, App Store) streams ARKit camera pose to this mod over OSC.");
 			Kino.UI.Label(connected ? "Status: receiving data" : "Status: no data (check LOTA is streaming, same Wi-Fi, matching port)");
 
+			string senderIp = receiver_.LastSenderAddress;
+			Kino.UI.Label(senderIp != null ? $"Last sender IP: {senderIp}" : "Last sender IP: (none yet)");
+
+			Kino.UI.HorizontalLine();
+			Kino.UI.GroupLabel("Update");
+			Kino.UI.Label($"Installed version: {CurrentVersion}");
+			Kino.UI.Label(updateStatus_);
+
+			if (!updateCheckInProgress_ && Kino.UI.Button(updateCheckInProgress_ ? "Checking..." : "Check for Update")) {
+				CheckForUpdate();
+			}
+
+			if (!string.IsNullOrEmpty(updateDownloadUrl_) && !updateDownloadInProgress_) {
+				if (Kino.UI.Button($"Download & Install v{updateLatestVersion_}")) {
+					DownloadUpdate();
+				}
+			}
+			else if (updateDownloadInProgress_) {
+				Kino.UI.Label("Downloading...");
+			}
+
 			Kino.UI.HorizontalLine();
 
 			if (IsInPhotoMode()) {
@@ -272,6 +615,7 @@ namespace HeadTrackARKit {
 			bool enabled = config_.Enabled;
 			if (Kino.UI.Toggle("Enabled", ref enabled)) {
 				config_.Enabled = enabled;
+				Kino.Log.Info($"[HeadTrackARKit] Enabled toggled {(enabled ? "ON" : "OFF")} from the settings panel.");
 				if (enabled) {
 					StartReceiver();
 				}
@@ -288,6 +632,25 @@ namespace HeadTrackARKit {
 					}
 				}
 			}
+
+			Kino.UI.Label("This PC's LAN IP (edit if auto-detect picked the wrong adapter):");
+			if (Kino.UI.Input(ref localIpText_, 45, "^[0-9a-fA-F:.]{0,45}$")) {
+				config_.LocalIpOverride = localIpText_;
+			}
+			Kino.UI.Label("Type the IP above and the port above into LOTA's Transmission Settings destination IP.");
+			if (Kino.UI.Button("Refresh IP (auto-detect)")) {
+				RefreshLocalIp();
+			}
+
+			Kino.UI.Label("Phone's IP (optional - only accept data from this exact address):");
+			if (Kino.UI.Input(ref phoneIpText_, 45, "^[0-9a-fA-F:.]{0,45}$")) {
+				config_.PhoneIpFilter = phoneIpText_;
+				receiver_.AllowedSenderFilter = phoneIpText_;
+			}
+
+			Kino.UI.HorizontalLine();
+
+			Kino.UI.Label(state_.IsCalibrated ? "Calibrated: yes" : "Calibrated: no - press F9 or the button below");
 
 			if (Kino.UI.Button("Set Neutral Position (F9)")) {
 				Calibrate();
@@ -386,7 +749,7 @@ namespace HeadTrackARKit {
 			Kino.UI.Label("1. On your iPhone, open LOTA (free, App Store) - no subscription needed.");
 			Kino.UI.Label("2. Stay on the main camera page (any mode except Motion).");
 			Kino.UI.Label("3. Tap the status bar pill (Transmission Settings), enable OSC.");
-			Kino.UI.Label("4. Set the destination IP to this PC's LAN address, port to match this mod (see Enabled/port above).");
+			Kino.UI.Label($"4. Set the destination IP to {localIpText_} and the port to {portText_} (shown above too).");
 			Kino.UI.Label("5. Make sure phone and PC are on the same Wi-Fi, then tap the shutter with STREAM selected.");
 
 			Kino.UI.HorizontalLine();

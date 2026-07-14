@@ -32,6 +32,8 @@
 	    UnityEngine.CoreModule.dll
 	    UnityEngine.PhysicsModule.dll        (needed for the cockpit clipping guard's raycasts)
 	    UnityEngine.InputLegacyModule.dll    (needed for UnityEngine.Input - scroll wheel zoom)
+	    UnityEngine.UnityWebRequestModule.dll (needed for UnityWebRequest - the update checker)
+	    UnityEngine.JSONSerializeModule.dll   (needed for JsonUtility - parses GitHub's response)
 
 	  Both live in:
 	    <CarX install>\Drift Racing Online_Data\Managed\
@@ -65,6 +67,14 @@
 		</Reference>
 		<Reference Include="UnityEngine.InputLegacyModule">
 			<HintPath>libs\UnityEngine.InputLegacyModule.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
+		<Reference Include="UnityEngine.UnityWebRequestModule">
+			<HintPath>libs\UnityEngine.UnityWebRequestModule.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
+		<Reference Include="UnityEngine.JSONSerializeModule">
+			<HintPath>libs\UnityEngine.JSONSerializeModule.dll</HintPath>
 			<Private>false</Private>
 		</Reference>
 		<Reference Include="Assembly-CSharp">

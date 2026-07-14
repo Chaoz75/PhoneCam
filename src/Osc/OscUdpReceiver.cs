@@ -23,6 +23,22 @@ namespace HeadTrackARKit.Osc {
 		/// <summary>Timestamp (Environment.TickCount) of the last successfully parsed packet, or 0 if none yet.</summary>
 		public volatile int LastMessageTick;
 
+		// Reference assignment is atomic in .NET and `volatile` gives the visibility guarantee
+		// needed for the background receive thread to hand this off to the main thread without
+		// a lock - same reasoning as LastMessageTick above.
+		private volatile string lastSenderAddress_;
+
+		/// <summary>IP address (no port) the most recent successfully-parsed packet came from, or null if none yet.</summary>
+		public string LastSenderAddress => lastSenderAddress_;
+
+		/// <summary>
+		/// If set (non-null, non-empty), only packets whose sender IP matches this string exactly
+		/// are accepted - everything else hitting the port is silently ignored. Null/empty (the
+		/// default) accepts from any sender. Settable from the main thread at any time; read by
+		/// the background receive thread, so this is volatile like the fields above.
+		/// </summary>
+		public volatile string AllowedSenderFilter;
+
 		public event Action<Exception> OnError;
 
 		public void Start(int port) {
@@ -80,8 +96,17 @@ namespace HeadTrackARKit.Osc {
 					continue;
 				}
 
+				string filter = AllowedSenderFilter;
+				if (!string.IsNullOrEmpty(filter) &&
+				    !string.Equals(remote.Address.ToString(), filter, StringComparison.OrdinalIgnoreCase)) {
+					// Doesn't match the configured phone IP - ignore silently, same as noise from
+					// any other device that happens to hit this port.
+					continue;
+				}
+
 				if (OscParser.TryParseMessage(data, data.Length, out OscMessage msg)) {
 					LastMessageTick = Environment.TickCount;
+					lastSenderAddress_ = remote.Address.ToString();
 					queue_.Enqueue(msg);
 				}
 			}
