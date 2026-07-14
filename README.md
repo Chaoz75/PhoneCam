@@ -9,6 +9,28 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.3.10** - Two changes based on the latest real-game feedback (a populated diagnostic log this
+time, plus explicit priority calls):
+- **Position tracking now supports room-scale, "walk around the car" movement, not just a small
+  seat-lean.** The actual bug behind "I move 3 steps left in real life and the camera doesn't go
+  with me": `Max position offset` defaulted to 0.5m and topped out at 1.5m on the slider, so any
+  real movement past that was silently clamped down to almost nothing - the tracking itself was
+  always working, it just had no room to move. Default is now 3.0m and the slider goes up to 10m.
+  This applies via a one-time migration (`PositionRangeUpgraded`) so it takes effect even on
+  installs that already have a saved 0.5m value from before - after that one bump, tuning the
+  slider yourself always sticks. Applies everywhere (driving included), same as before - no
+  mode-specific gating was added.
+- **Gauge HUD "acting weird" - stopped fighting it, hid it instead.** Two direct fixes (0.3.7's
+  Transform-decoupling, 0.3.8's revert-plus-matrix-override) didn't stop MultiHUD's gauge Canvas
+  from visibly reacting to head movement/zoom, because that reaction is by design for a
+  Screen-Space-Camera Canvas reading the real camera Transform/FOV - not a bug in this mod's own
+  camera handling to begin with. Rather than keep fighting a Canvas this mod doesn't own, 0.3.10
+  finds MultiHUD's gauge object(s) at runtime by name (`speedometer`/`tachometer`/`rpmgauge`,
+  case-insensitive) and simply deactivates them while PhoneCam is enabled, reactivating them the
+  instant it's turned off. On by default (`HideGaugesWhileTracking`, one-time-migrated the same
+  way as the position range above) - a "Gauge HUD workaround" toggle and status label (how many
+  objects were found) are in the settings panel if you'd rather leave the gauges alone.
+
 **0.3.9** - Two fixes from the latest real-game feedback:
 - **Zoom is now smoothed.** Scroll wheel / +/- keys used to snap the FOV offset instantly to its
   new value; now it eases toward that target every frame (frame-rate independent). A new "Zoom
@@ -419,6 +441,24 @@ libs/                       You put KSL.API.dll / UnityEngine.CoreModule.dll her
   not better. 0.3.8 writes to the real Transform/FOV again (keeping every such system in sync)
   while still separately rebuilding the view/projection matrices to guarantee Kino's Custom
   Camera mode can't ignore the change.
+- **Gauge HUD desync: closed as of 0.3.10, by hiding rather than fixing.** Two direct attempts
+  (0.3.7's decoupling, 0.3.8's revert-plus-matrix-override) didn't stop it, and it kept getting
+  re-reported across three real-game test rounds. Root cause is almost certainly unfixable from
+  this mod's side at all: MultiHUD's gauge Canvas is a separate mod's Screen-Space-Camera UI,
+  which is *designed* to read the real camera Transform/FOV every frame - any camera movement or
+  FOV change this mod makes (or any other mod/game system makes) will always be visible to it,
+  the same way it would be to any other Screen-Space-Camera UI in the scene. 0.3.10 sidesteps this
+  entirely: it finds the gauge object(s) by name at runtime and deactivates them outright while
+  PhoneCam is enabled, restoring them the instant it's turned off - see `HeadTrackMod.
+  RefreshGaugeObjects`/`SetGaugesHidden`. Trade-off: gauges aren't visible at all while tracking
+  is on, which is why it's a toggle (`HideGaugesWhileTracking`), not a forced behavior.
+- **Position tracking range: the "can't walk around" report was a clamp, not a broken pipeline.**
+  `HeadTrackState.GetPositionOffset()` was already computing a correct, calibration-relative
+  translation delta every frame - `Max position offset` (0.5m default, 1.5m slider ceiling) was
+  just clamping any real movement larger than a small seat-lean down to a few centimeters, which
+  is indistinguishable from "not working" in practice. 0.3.10 raises the default to 3.0m and the
+  slider ceiling to 10m (with a one-time migration so existing saved configs pick up the new
+  default too) - no changes were needed to the actual tracking/calibration math itself.
 - **`Unable to save config 'PhoneCam.ksc': NullReferenceException`** appears repeatedly in the
   logs, correlated with rapid Enabled-toggle/F9/zoom-reset actions. The stack trace is entirely
   inside KSL's own obfuscated internals, not this mod's code, so there's nothing to fix on this

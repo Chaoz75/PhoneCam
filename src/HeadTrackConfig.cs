@@ -25,6 +25,15 @@ namespace HeadTrackARKit {
 		/// <summary>Max translation offset, in meters, applied per axis after sensitivity scaling.</summary>
 		float MaxPositionOffset { get; set; }
 
+		/// <summary>
+		/// One-time migration flag - the very first time this loads on 0.3.10+, MaxPositionOffset
+		/// gets bumped from the old 0.5m "seat lean" default up to a "walk a few real steps"
+		/// free-cam-scale default, even for installs that already have a saved (smaller) value from
+		/// before. After that one bump this is never touched again, so tuning the slider afterward
+		/// always sticks.
+		/// </summary>
+		bool PositionRangeUpgraded { get; set; }
+
 		/// <summary>Max rotation offset, in degrees, applied per euler axis after sensitivity scaling.</summary>
 		float MaxRotationOffset { get; set; }
 
@@ -83,6 +92,25 @@ namespace HeadTrackARKit {
 
 		/// <summary>Flips the left/right look direction after the pitch/yaw swap.</summary>
 		bool InvertYaw { get; set; }
+
+		// --- Gauge HUD (MultiHUD) conflict workaround ---
+		// Two direct fixes (0.3.8's Transform-mutation revert + matrix override, and just living
+		// with it) didn't stop MultiHUD's gauge Canvas from visibly reacting to every head
+		// movement/zoom - it reads the camera's real Transform/FOV directly by design (Screen-Space
+		// -Camera rendering), so anything that moves the camera moves it too. Rather than keep
+		// fighting a Canvas this mod doesn't own, 0.3.10 just hides it outright while PhoneCam is
+		// enabled and restores it the moment PhoneCam is turned off.
+
+		/// <summary>
+		/// When true (default from 0.3.10 on), MultiHUD's gauge object(s) - found at runtime by
+		/// name, see HeadTrackMod.RefreshGaugeObjects - are deactivated while config_.Enabled is
+		/// true, and reactivated the moment it's turned off. Turn off to leave the gauges alone
+		/// (they'll go back to reacting to head movement/zoom as before).
+		/// </summary>
+		bool HideGaugesWhileTracking { get; set; }
+
+		/// <summary>One-time migration flag mirroring PositionRangeUpgraded - see that property.</summary>
+		bool GaugeWorkaroundDefaultsApplied { get; set; }
 
 		// --- Privacy ---
 

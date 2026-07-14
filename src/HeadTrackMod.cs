@@ -11,6 +11,7 @@ using KSL.API;
 using UnityEngine;
 using UnityEngine.Networking;
 using UnityEngine.Rendering;
+using UnityEngine.SceneManagement;
 
 namespace HeadTrackARKit {
 	/// <summary>
@@ -22,14 +23,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.3.9", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.3.10", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.3.9";
+		private const string CurrentVersion = "0.3.10";
 
 		private const int DefaultOscPort = 9000;
 
@@ -100,6 +101,19 @@ namespace HeadTrackARKit {
 		// every frame (see Update()) so zoom feels smooth instead of snapping instantly.
 		private float zoomTargetDegrees_;
 		private float zoomCurrentDegrees_;
+
+		// --- MultiHUD gauge conflict workaround ---
+		// MultiHUD's gauge Canvas (confirmed "UGUI") reads the camera's real Transform/FOV
+		// directly - two direct fixes (0.3.8's revert-to-Transform + matrix override) never
+		// stopped it from visibly reacting to head movement/zoom, because that reaction is by
+		// design for a Screen-Space-Camera Canvas, not a bug in this mod's own camera handling.
+		// Rather than keep fighting a Canvas this mod doesn't own, these objects are located by
+		// name at runtime and simply deactivated while config_.Enabled is true, then reactivated
+		// the moment it's turned off - see UpdateGaugeVisibility.
+		private static readonly string[] GaugeNameKeywords = { "speedometer", "tachometer", "rpmgauge" };
+		private readonly List<GameObject> gaugeObjects_ = new List<GameObject>();
+		private bool gaugesHidden_;
+		private float lastGaugeSearchTime_;
 
 		// --- In-game updater ---
 		// Checks GitHub Releases directly (not KSL's own updater, which only runs at game
@@ -194,6 +208,8 @@ namespace HeadTrackARKit {
 			float smoothing = Mathf.Clamp01(config_.ZoomSmoothing);
 			float rate = 1f - Mathf.Pow(1f - smoothing, Time.unscaledDeltaTime * 60f);
 			zoomCurrentDegrees_ = Mathf.Lerp(zoomCurrentDegrees_, zoomTargetDegrees_, rate);
+
+			UpdateGaugeVisibility();
 		}
 
 		private void LateUpdate() {
@@ -221,6 +237,83 @@ namespace HeadTrackARKit {
 		private void ResetZoom() {
 			zoomTargetDegrees_ = 0f;
 			Kino.Log.Info("[HeadTrackARKit] Zoom reset.");
+		}
+
+		/// <summary>
+		/// Hides (or restores) MultiHUD's gauge object(s) depending on whether PhoneCam is
+		/// currently enabled - see the field comments on gaugeObjects_/GaugeNameKeywords for why
+		/// this exists instead of another attempt to keep the gauges in sync with the camera.
+		/// Runs every frame from Update(), but the actual scene search only happens periodically
+		/// (see lastGaugeSearchTime_) and only while nothing has been found yet.
+		/// </summary>
+		private void UpdateGaugeVisibility() {
+			if (config_.HideGaugesWhileTracking && config_.Enabled) {
+				if (Time.unscaledTime - lastGaugeSearchTime_ > 2f) {
+					lastGaugeSearchTime_ = Time.unscaledTime;
+					gaugeObjects_.RemoveAll(go => go == null);
+					if (gaugeObjects_.Count == 0) {
+						RefreshGaugeObjects();
+					}
+				}
+				SetGaugesHidden(true);
+			}
+			else {
+				SetGaugesHidden(false);
+			}
+		}
+
+		/// <summary>
+		/// Searches every root GameObject in the active scene for anything whose name contains one
+		/// of GaugeNameKeywords, including inactive objects (a plain recursive Transform walk sees
+		/// inactive children too, unlike FindObjectsByType with the default "active only" mode).
+		/// Cheap enough to run every couple of seconds - it's a plain tree walk, not a per-frame cost.
+		/// </summary>
+		private void RefreshGaugeObjects() {
+			Scene scene = SceneManager.GetActiveScene();
+			foreach (GameObject root in scene.GetRootGameObjects()) {
+				CollectGaugeObjects(root.transform);
+			}
+
+			if (gaugeObjects_.Count > 0) {
+				var names = new List<string>();
+				foreach (GameObject go in gaugeObjects_) names.Add(go.name);
+				Kino.Log.Info($"[HeadTrackARKit] Found {gaugeObjects_.Count} gauge object(s): {string.Join(", ", names)}");
+			}
+		}
+
+		private void CollectGaugeObjects(Transform t) {
+			string lower = t.name.ToLowerInvariant();
+			foreach (string keyword in GaugeNameKeywords) {
+				if (lower.Contains(keyword)) {
+					gaugeObjects_.Add(t.gameObject);
+					break;
+				}
+			}
+
+			for (int i = 0; i < t.childCount; i++) {
+				CollectGaugeObjects(t.GetChild(i));
+			}
+		}
+
+		/// <summary>
+		/// Applies the hidden/shown state to every currently-known gauge object. Only logs on an
+		/// actual state change (not every frame), and re-applies to any newly-found objects even if
+		/// the overall state didn't just change, so an object found mid-session while already
+		/// hidden still gets hidden immediately instead of waiting for the next toggle.
+		/// </summary>
+		private void SetGaugesHidden(bool hidden) {
+			bool changed = hidden != gaugesHidden_;
+			gaugesHidden_ = hidden;
+
+			foreach (GameObject go in gaugeObjects_) {
+				if (go != null && go.activeSelf == hidden) {
+					go.SetActive(!hidden);
+				}
+			}
+
+			if (changed && gaugeObjects_.Count > 0) {
+				Kino.Log.Info($"[HeadTrackARKit] {(hidden ? "Hiding" : "Restoring")} {gaugeObjects_.Count} gauge object(s) (MultiHUD conflict workaround).");
+			}
 		}
 
 		private void HandleOscMessage(OscMessage msg) {
@@ -737,8 +830,26 @@ namespace HeadTrackARKit {
 			if (config_.RotationSensitivity <= 0) config_.RotationSensitivity = 1.0f;
 			if (config_.PositionSmoothing <= 0) config_.PositionSmoothing = 0.35f;
 			if (config_.RotationSmoothing <= 0) config_.RotationSmoothing = 0.45f;
-			if (config_.MaxPositionOffset <= 0) config_.MaxPositionOffset = 0.5f;
+			if (config_.MaxPositionOffset <= 0) config_.MaxPositionOffset = 3.0f;
 			if (config_.MaxRotationOffset <= 0) config_.MaxRotationOffset = 80f;
+
+			// One-time bump from the old 0.5m "seat lean" default up to a "walk a few real steps"
+			// free-cam-scale default - runs even for installs that already have a saved (smaller)
+			// value from a previous version, since the plain <=0 check above only catches a truly
+			// unset value. Only ever fires once per install; tuning the slider afterward always
+			// sticks from then on.
+			if (!config_.PositionRangeUpgraded) {
+				config_.MaxPositionOffset = 3.0f;
+				config_.PositionRangeUpgraded = true;
+			}
+
+			// Same one-time-bump pattern for the new gauge-hide workaround - defaults it to ON
+			// (the chosen fix for the recurring gauge-desync reports) without a plain bool default
+			// silently reverting a user's own later choice to turn it back off.
+			if (!config_.GaugeWorkaroundDefaultsApplied) {
+				config_.HideGaugesWhileTracking = true;
+				config_.GaugeWorkaroundDefaultsApplied = true;
+			}
 			if (config_.ZoomSensitivity <= 0) config_.ZoomSensitivity = 1.5f;
 			if (config_.MaxZoomOffset <= 0) config_.MaxZoomOffset = 30f;
 			if (config_.ZoomSmoothing <= 0) config_.ZoomSmoothing = 0.2f;
@@ -878,6 +989,23 @@ namespace HeadTrackARKit {
 			}
 
 			Kino.UI.HorizontalLine();
+			Kino.UI.GroupLabel("Gauge HUD workaround");
+			Kino.UI.Label("MultiHUD's speedometer reads the camera directly, so it reacts to every head " +
+				"movement/zoom the same way the 3D view does - two direct fixes didn't stop that from " +
+				"looking wrong. This hides it entirely while PhoneCam is enabled instead, and restores " +
+				"it the moment PhoneCam is turned off.");
+
+			bool hideGauges = config_.HideGaugesWhileTracking;
+			if (Kino.UI.Toggle("Hide gauges while PhoneCam is enabled", ref hideGauges)) {
+				config_.HideGaugesWhileTracking = hideGauges;
+				if (!hideGauges) SetGaugesHidden(false);
+			}
+
+			Kino.UI.Label(gaugeObjects_.Count > 0
+				? $"Found {gaugeObjects_.Count} gauge object(s) to hide."
+				: "No gauge object found yet - only searches while this is on and PhoneCam is enabled, so get into a session with the HUD visible first.");
+
+			Kino.UI.HorizontalLine();
 
 			Kino.UI.Label(state_.IsCalibrated ? "Calibrated: yes" : "Calibrated: no - press F9 or the button below");
 
@@ -916,8 +1044,11 @@ namespace HeadTrackARKit {
 
 			Kino.UI.GroupLabel("Safety clamps");
 
+			// Widened from the original 0.05-1.5m range so real-world walking (leaning several
+			// steps left/right, not just a small seat-lean) has room to actually reach the camera
+			// instead of getting clamped down to almost nothing - see PositionRangeUpgraded.
 			float maxPos = config_.MaxPositionOffset;
-			if (Kino.UI.Slider(ref maxPos, 0.05f, 1.5f, $"Max position offset: {maxPos:F2} m")) {
+			if (Kino.UI.Slider(ref maxPos, 0.05f, 10f, $"Max position offset: {maxPos:F2} m (raise for room-scale movement)")) {
 				config_.MaxPositionOffset = maxPos;
 				state_.MaxPositionOffset = maxPos;
 			}
@@ -992,7 +1123,9 @@ namespace HeadTrackARKit {
 			Kino.UI.Label("Sit in your normal position, then press F9 to set neutral - everything after is relative to that pose.");
 			Kino.UI.Label("Re-press F9 any time you shift position.");
 			Kino.UI.Label("Mouse wheel or +/- zooms the camera; F10 resets zoom.");
+			Kino.UI.Label("Leaning/walking moves the camera too - raise 'Max position offset' in Sensitivity/Safety clamps for bigger, room-scale movement.");
 			Kino.UI.Label("Cockpit clipping guard (off by default) stops the camera short of the dashboard/seat when leaning in.");
+			Kino.UI.Label("Gauges hide automatically while PhoneCam is enabled (toggle in 'Gauge HUD workaround') since MultiHUD's speedometer reacts to every head movement/zoom otherwise.");
 
 			Kino.UI.HorizontalLine();
 			Kino.UI.Hyperlink("Get LOTA on the App Store", "https://apps.apple.com/app/id6760984302");
