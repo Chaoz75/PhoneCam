@@ -10,6 +10,7 @@ using HeadTrackARKit.Tracking;
 using KSL.API;
 using UnityEngine;
 using UnityEngine.Networking;
+using UnityEngine.Rendering;
 
 namespace HeadTrackARKit {
 	/// <summary>
@@ -21,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.3.3", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.3.4", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.3.3";
+		private const string CurrentVersion = "0.3.4";
 
 		private const int DefaultOscPort = 9000;
 
@@ -75,12 +76,12 @@ namespace HeadTrackARKit {
 		private string phoneIpText_ = "";
 
 		// --- Diagnostics ---
-		// Since Kino's own camera system (kino.dll) is obfuscated and can't be inspected the way
-		// Assembly-CSharp was, guessing at another fix isn't productive right now. This logs
-		// ground-truth info into KSL's log instead: every distinct camera Unity actually renders
-		// through each frame (once each, so it doesn't spam), plus a periodic heartbeat showing
-		// what GetActiveCamera() currently resolves to. Whatever the next log dump shows will
-		// point at the real camera to target, rather than another guess.
+		// Kept even after finding the real bug (see the Camera.onPreCull subscription comment in
+		// Start() - this game runs a Scriptable Render Pipeline, so onPreCull never fired at all,
+		// regardless of camera targeting logic) - useful going forward for confirming the SRP
+		// hook actually reaches the right camera. Logs every distinct camera Unity renders through
+		// once each (so it doesn't spam), plus a periodic heartbeat showing what
+		// GetActiveCamera() currently resolves to.
 		private readonly HashSet<string> loggedCameraNames_ = new HashSet<string>();
 		private float lastDiagnosticLogTime_;
 
@@ -143,13 +144,24 @@ namespace HeadTrackARKit {
 				StartReceiver();
 			}
 
+			// Camera.onPreCull only fires under Unity's legacy Built-in Render Pipeline - it never
+			// fires at all if a Scriptable Render Pipeline (URP/HDRP) is active, which is looking
+			// like the actual explanation for why 0.3.1/0.3.2's diagnostics logged nothing even
+			// unconditionally: the KSL log lines "Enabled volume override" / "Enabled sky
+			// override" are Volume Framework terminology, which is SRP-only. RenderPipelineManager
+			// .beginCameraRendering is the SRP equivalent hook (fires once per camera, right
+			// before it renders, same as onPreCull's timing guarantee) - subscribing to both costs
+			// nothing, since a project only ever runs one pipeline at a time, so only the relevant
+			// one will ever actually call back.
 			Camera.onPreCull += OnCameraPreCull;
+			RenderPipelineManager.beginCameraRendering += OnBeginCameraRendering;
 
 			Kino.Log.Info($"[HeadTrackARKit] Loaded. Enabled={config_.Enabled}. Bind key default: F9 to calibrate neutral position.");
 		}
 
 		private void OnDestroy() {
 			Camera.onPreCull -= OnCameraPreCull;
+			RenderPipelineManager.beginCameraRendering -= OnBeginCameraRendering;
 			receiver_.Stop();
 		}
 
@@ -243,6 +255,15 @@ namespace HeadTrackARKit {
 
 			t.position += t.rotation * posOffset;
 			t.rotation = t.rotation * rotOffset;
+		}
+
+		/// <summary>
+		/// SRP (URP/HDRP) equivalent of <see cref="OnCameraPreCull"/> - see the comment on the
+		/// subscription in <see cref="Start"/> for why both are hooked. Same logic either way, so
+		/// this just forwards into the existing handler rather than duplicating it.
+		/// </summary>
+		private void OnBeginCameraRendering(ScriptableRenderContext context, Camera cam) {
+			OnCameraPreCull(cam);
 		}
 
 		/// <summary>

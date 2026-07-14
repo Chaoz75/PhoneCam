@@ -9,6 +9,15 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.3.4** - Found and fixed the real cause of "receiving data + calibrated, but the camera never
+moves": this game runs a Scriptable Render Pipeline (URP/HDRP), and `Camera.onPreCull` - the hook
+this mod relied on since 0.1.0 - is a documented no-op under any SRP, full stop, regardless of
+camera targeting. 0.3.2's fully-unconditional diagnostic logging came back with zero `[diag]`
+lines across several play sessions with Enabled confirmed on, which is what confirmed it (rather
+than a targeting miss). Fix: also subscribe to `RenderPipelineManager.beginCameraRendering`, the
+SRP equivalent hook with the same timing guarantee. Both hooks stay subscribed; whichever one the
+project's actual pipeline calls is the one that does the work.
+
 **0.3.3** - Adds an in-game updater. New "Update" section at the top of the PhoneCam menu:
 **Check for Update** queries this repo's latest GitHub Release, and if it's newer than the
 installed version, **Download & Install** fetches the `PhoneCam.ksm` asset straight into
@@ -247,13 +256,25 @@ libs/                       You put KSL.API.dll / UnityEngine.CoreModule.dll her
     `StaticCamera`, etc.) is currently active. Since `BaseCamera` extends `MonoBehaviour`, the
     real `Camera` component sits on the same GameObject.
 
-  `HeadTrackMod.GetActiveCamera()` now resolves the target camera in three layers:
+  `HeadTrackMod.GetActiveCamera()` resolves the target camera in three layers:
   `CameraSwitch.instance.FindActiveCamera()` first (covers every mode CarX itself tracks, no
   reflection needed since everything involved is public), then the Photo-Mode-specific
-  reflection fix as a fallback, then `Camera.main` as a last resort. This should cover cockpit,
-  follow/hood, rear, static, replay, and photo modes - but since none of this has been run
-  against the real game yet from this end, if any mode still doesn't move the camera, that's
-  the next thing to report back with (which mode, and whether "Calibrated: yes" was showing).
+  reflection fix as a fallback, then `Camera.main` as a last resort. This covers cockpit,
+  follow/hood, rear, static, replay, and photo modes.
+- **Found the real reason tracking still didn't move the camera in 0.3.0-0.3.3, despite correct
+  camera targeting: this game runs a Scriptable Render Pipeline (URP or HDRP), not Unity's
+  legacy Built-in Render Pipeline.** `Camera.onPreCull` - the hook this mod applied its offset
+  through - only ever fires under the legacy pipeline; it's a documented no-op under any SRP,
+  regardless of which camera is targeted or whether it's enabled. The KSL log confirmed this
+  indirectly (`Enabled volume override` / `Enabled sky override` - Volume Framework terms,
+  SRP-only), and directly: 0.3.2's diagnostic logging was made fully unconditional and still
+  produced zero `[diag]` lines across multiple full play sessions with Enabled confirmed on -
+  the callback simply never fired, no matter what.
+
+  Fixed in 0.3.4 by also subscribing to `RenderPipelineManager.beginCameraRendering` - the SRP
+  equivalent hook, same per-camera/right-before-render timing guarantee as `onPreCull`. Both
+  subscriptions are kept active; only the one matching the project's actual pipeline will ever
+  call back, so this doesn't need to guess which one applies.
 - The zoom offset and head-tracking offset both add on top of whatever CarX outputs that
   frame (including its own shake/FOV effects) rather than replacing it — this is deliberate,
   but means extreme zoom + a game effect that also changes FOV heavily could stack oddly.
