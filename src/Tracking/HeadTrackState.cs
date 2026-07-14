@@ -38,6 +38,12 @@ namespace HeadTrackARKit.Tracking {
 		private Vector3 basePosition_;
 		private Quaternion baseRotationInverse_ = Quaternion.identity;
 
+		// 0.3.15: world-referenced calibration baseline for rotation - see GetRotationOffsetEuler's
+		// doc comment for why yaw/pitch are measured this way instead of via baseRotationInverse_.
+		private float baseYaw_;
+		private float basePitch_;
+		private float baseRoll_;
+
 		public bool IsCalibrated => isCalibrated_;
 		public bool HasSignal => hasRawSample_;
 
@@ -64,6 +70,7 @@ namespace HeadTrackARKit.Tracking {
 
 			basePosition_ = smoothedPosition_;
 			baseRotationInverse_ = Quaternion.Inverse(smoothedRotation_);
+			ComputeWorldYawPitchRoll(smoothedRotation_, out baseYaw_, out basePitch_, out baseRoll_);
 			isCalibrated_ = true;
 		}
 
@@ -95,47 +102,69 @@ namespace HeadTrackARKit.Tracking {
 		/// 0.3.11 removed the pitch/yaw clamp but kept computing this via
 		/// <c>delta.eulerAngles</c> - real-game testing then showed the actual bug: standard XYZ
 		/// Euler decomposition isn't stable everywhere, and yaw approaching +-180 degrees (i.e.
-		/// looking behind you - an extremely common direction, not an edge case) sits right in an
-		/// unstable region for it. A real log confirmed it directly: a near-pure yaw turn came back
-		/// with a huge, spurious roll component (appliedOffsetEuler jumping to roll=284 with no
-		/// roll motion actually happening) - rotation was "bleeding" between axes exactly where the
-		/// user reported the camera going to "weird angles."
+		/// looking behind you) sits right in an unstable region for it, bleeding rotation between
+		/// axes. 0.3.12 fixed that by extracting yaw/pitch via atan2 from a *delta* quaternion
+		/// (<c>baseRotationInverse_ * smoothedRotation_</c>) instead of decomposing eulerAngles.
 		///
-		/// Fixed in 0.3.12 by extracting yaw and pitch directly from the delta's forward vector via
-		/// atan2 instead: atan2 has no such instability across the entire yaw range and only
-		/// degenerates when looking exactly straight up or down, a far rarer case for a driving
-		/// camera than "look behind you." Roll is computed separately as whatever twist remains
-		/// after removing yaw/pitch (via LookRotation), which reduces to reading .eulerAngles off a
-		/// quaternion that's mathematically a *pure single-axis rotation* - safe with no instability
-		/// of its own, unlike decomposing the full compound delta rotation directly.
+		/// That still wasn't enough: a v0.3.14 log caught the camera pitching hard on ordinary
+		/// left/right turning (appliedOffsetEuler.x reaching -89 after roughly a 90-degree turn),
+		/// and the same log's incomingEuler showed why - this rig's roll (z) sits around 85-98
+		/// degrees *all the time*, meaning the phone is physically held/mounted rolled about 90
+		/// degrees from "upright." A delta quaternion re-expresses rotation in the *phone's own
+		/// calibrated-local frame* - and if that frame is itself rolled ~90 degrees from true
+		/// world-vertical, a real yaw motion (turning around the true vertical axis) ends up
+		/// aligned with the phone's local *pitch* axis instead, so atan2 faithfully reports a big
+		/// pitch even though the user only turned left/right. This isn't a decomposition-instability
+		/// bug like 0.3.12's - the delta math was working exactly as designed, it's just the wrong
+		/// reference frame for a rig with a non-trivial mounting roll.
 		///
-		/// Returned as a Vector3, not reassembled into a Quaternion here, specifically so
-		/// HeadTrackMod.FixLookDirection can swap/invert these already-clean pitch/yaw numbers
-		/// directly - reassembling into a Quaternion and then reading .eulerAngles back out a
-		/// second time (as the previous Quaternion-returning version required) would reintroduce
-		/// the exact same decomposition instability this fix removes.
+		/// Fixed in 0.3.15 by measuring yaw/pitch against true world axes instead of the phone's
+		/// own (possibly rolled) calibrated frame: both the current orientation and the calibration
+		/// baseline get their own world-referenced (yaw, pitch, roll) via
+		/// <see cref="ComputeWorldYawPitchRoll"/>, and the *offsets* are plain angle subtractions
+		/// (yaw-yaw, pitch-pitch, roll-roll), each wrapped to -180..180. Because both quantities are
+		/// always measured against the same fixed world axes, whatever constant roll the phone
+		/// happens to be held at cancels out of the subtraction cleanly - a real yaw turn stays yaw
+		/// regardless of mounting angle.
 		/// </summary>
 		public Vector3 GetRotationOffsetEuler() {
 			if (!isCalibrated_ || !hasSmoothedSample_) return Vector3.zero;
 
-			Quaternion delta = baseRotationInverse_ * smoothedRotation_;
-			Vector3 fwd = delta * Vector3.forward;
+			ComputeWorldYawPitchRoll(smoothedRotation_, out float yaw, out float pitch, out float roll);
 
-			float yaw = Mathf.Atan2(fwd.x, fwd.z) * Mathf.Rad2Deg;
-			float horizontalLen = Mathf.Sqrt(fwd.x * fwd.x + fwd.z * fwd.z);
-			float pitch = Mathf.Atan2(-fwd.y, horizontalLen) * Mathf.Rad2Deg;
-
-			// yawPitchOnly points the same direction as delta (same forward vector) with zero
-			// roll by construction (Quaternion.LookRotation always picks the least-rolled
-			// orientation for a given forward+up pair). Subtracting it out of delta leaves a pure
-			// rotation around the shared forward axis - i.e. just the roll, cleanly.
-			Quaternion yawPitchOnly = Quaternion.LookRotation(fwd, Vector3.up);
-			float roll = NormalizeAngle((Quaternion.Inverse(yawPitchOnly) * delta).eulerAngles.z);
-
-			Vector3 euler = new Vector3(pitch, yaw, roll) * RotationSensitivity;
+			Vector3 euler = new Vector3(
+				NormalizeAngle(pitch - basePitch_),
+				NormalizeAngle(yaw - baseYaw_),
+				NormalizeAngle(roll - baseRoll_)) * RotationSensitivity;
 			euler.z = Mathf.Clamp(euler.z, -MaxRotationOffsetDegrees, MaxRotationOffsetDegrees);
 
 			return euler;
+		}
+
+		/// <summary>
+		/// World-referenced (yaw, pitch, roll) for an absolute orientation quaternion - yaw is
+		/// rotation around true world-up (Vector3.up), pitch is elevation above/below the world-
+		/// horizontal plane, and roll is the twist remaining around the forward axis once yaw/pitch
+		/// are accounted for. Using world axes (rather than a calibrated-local delta) means these
+		/// three numbers mean the same physical thing - "compass heading," "look up/down,"
+		/// "tilt sideways" - no matter what roll the phone itself is held/mounted at; see
+		/// GetRotationOffsetEuler's doc comment for why that distinction matters. Degenerates only
+		/// when looking exactly straight up or down (fwd parallel to Vector3.up), same as the
+		/// atan2/LookRotation approach it's built from.
+		/// </summary>
+		private static void ComputeWorldYawPitchRoll(Quaternion q, out float yaw, out float pitch, out float roll) {
+			Vector3 fwd = q * Vector3.forward;
+
+			yaw = Mathf.Atan2(fwd.x, fwd.z) * Mathf.Rad2Deg;
+			float horizontalLen = Mathf.Sqrt(fwd.x * fwd.x + fwd.z * fwd.z);
+			pitch = Mathf.Atan2(-fwd.y, horizontalLen) * Mathf.Rad2Deg;
+
+			// zeroRoll points the same direction (same forward vector) with zero roll relative to
+			// world-up by construction (Quaternion.LookRotation always picks the least-rolled
+			// orientation for a given forward+up pair). Whatever's left after removing it is a pure
+			// rotation around the shared forward axis - i.e. just the roll, cleanly.
+			Quaternion zeroRoll = Quaternion.LookRotation(fwd, Vector3.up);
+			roll = NormalizeAngle((Quaternion.Inverse(zeroRoll) * q).eulerAngles.z);
 		}
 
 		// Unity's eulerAngles are 0..360 per axis, which makes small negative rotations show up

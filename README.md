@@ -9,6 +9,32 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.3.15** - Same "look left = up, look right = down" symptom kept coming back even after 0.3.13
+removed the pitch/yaw swap, and the 0.3.14 log finally explained why: this rig's incoming roll
+sits around 85-98 degrees *constantly* - the phone is physically held/mounted rolled about 90
+degrees from "upright." `HeadTrackState.GetRotationOffsetEuler` extracted yaw/pitch from a delta
+quaternion (`baseRotationInverse_ * smoothedRotation_`), which measures rotation in the *phone's
+own calibrated-local frame* - correct in general, but if that frame is itself rolled ~90 degrees
+from true world-vertical, a genuine yaw turn (rotating around the true vertical axis) lines up with
+the phone's local *pitch* axis instead, so a clean, correctly-computed atan2 pitch value legitimately
+comes out huge (confirmed directly: `appliedOffsetEuler.x=-89` after roughly a 90-degree turn). Not
+a decomposition bug this time - the delta math was doing exactly what it's designed to do, just in
+the wrong reference frame for a rig with real mounting roll. **Fixed by measuring yaw/pitch against
+true world axes instead**: both the live orientation and the calibration baseline get their own
+world-referenced (yaw, pitch, roll) - see `HeadTrackState.ComputeWorldYawPitchRoll` - and the offset
+is a plain per-axis angle subtraction, wrapped to -180..180. Since both sides of that subtraction are
+always measured against the same fixed world axes, whatever constant roll the phone happens to be
+held at cancels out cleanly, regardless of its exact value. If you'd toggled "Invert up/down" or
+"Invert left/right" while chasing this, reset both to off before retesting - they were compensating
+for the old bug and may fight the real fix.
+
+Also: the in-car dashboard gauge needles ("digidash," "digiboost," etc., confirmed via the now-
+removed diagnostic scan to NOT be parented under the camera) visibly swinging while looking around
+may well have been a *symptom* of this same bug rather than a separate issue - wild, incorrect pitch
+swings from the coupling above would send the camera whipping past the dashboard in exactly the way
+that'd look like "the gauges are moving." Worth confirming after this fix before treating it as
+still-open.
+
 **0.3.14** - Three changes:
 - **Removed the Gauge HUD workaround entirely** (the "Hide gauges while PhoneCam is enabled"
   toggle and the "Log dashboard gauge diagnostics" button, plus all the supporting code and
