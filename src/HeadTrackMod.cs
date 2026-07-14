@@ -22,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.3.5", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.3.6", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.3.5";
+		private const string CurrentVersion = "0.3.6";
 
 		private const int DefaultOscPort = 9000;
 
@@ -283,6 +283,35 @@ namespace HeadTrackARKit {
 
 			t.position += t.rotation * posOffset;
 			t.rotation = t.rotation * rotOffset;
+
+			// 0.3.5 confirmed (via diagnostic log) that this handler runs, resolves the correct
+			// on-screen camera, and writes to its Transform last every frame - yet in Kino's own
+			// "Custom Camera" mode (the one driven by mouse/keyboard look, per the user's report)
+			// the view still didn't move at all. The most likely remaining explanation: that
+			// camera system sets Camera.worldToCameraMatrix explicitly rather than letting Unity
+			// derive the view matrix from the Transform each frame - and once a custom matrix is
+			// set, Unity keeps using it and ignores further Transform changes for rendering
+			// purposes (a well-known Unity gotcha for exactly this kind of camera rig) until
+			// ResetWorldToCameraMatrix() is called. Rebuilding and re-assigning the view matrix
+			// from this now-offset transform, unconditionally and last, sidesteps that entirely:
+			// it's mathematically identical to Unity's own default when nothing else is
+			// customizing the matrix (so this is a no-op visually in normal driving/replay/photo
+			// modes), and it wins outright when something is.
+			ApplyViewMatrixFromTransform(cam);
+		}
+
+		/// <summary>
+		/// Manually rebuilds <c>Camera.worldToCameraMatrix</c> from the camera's current
+		/// Transform, matching what Unity computes by default. See the comment at the call site
+		/// in <see cref="OnCameraPreCull"/> for why this is necessary at all.
+		/// </summary>
+		private static void ApplyViewMatrixFromTransform(Camera cam) {
+			Matrix4x4 m = cam.transform.worldToLocalMatrix;
+			// Unity's camera space looks down local -Z, while a plain worldToLocalMatrix follows
+			// the transform's own +Z-forward convention - flipping the Z row is the standard way
+			// to reconcile the two when building a view matrix manually.
+			m.SetRow(2, -m.GetRow(2));
+			cam.worldToCameraMatrix = m;
 		}
 
 		/// <summary>

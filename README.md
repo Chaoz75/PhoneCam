@@ -9,6 +9,18 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.3.6** - Real-game test of 0.3.5 confirmed the handler runs, resolves the correct on-screen
+camera, and applies last every frame - but in Kino's own "Custom Camera" mode (the mouse/keyboard
+free-look mode) the view still didn't move at all. Best-evidenced explanation: that camera system
+likely sets `Camera.worldToCameraMatrix` explicitly, which makes Unity ignore further Transform
+changes for rendering purposes until `ResetWorldToCameraMatrix()` is called - a known Unity
+behavior for exactly this kind of camera rig. This build rebuilds and re-assigns the view matrix
+directly from the (now offset) Transform every frame, unconditionally, right after applying the
+offset. This is mathematically identical to Unity's own default when nothing else is customizing
+the matrix (so it should be a no-op in normal driving/replay/photo modes), and wins outright when
+something else is. Not yet confirmed in a real play session - this is the best next guess given
+`kino.dll` can't be inspected directly, not a confirmed root cause.
+
 **0.3.5** - The SRP hook (0.3.4) got the callback firing again, and the diagnostic log confirmed
 `GetActiveCamera()` was correctly resolving to the real render camera - but the offset still had
 no visible effect on the camera view (a dashboard element moved, the outside view didn't). Root
@@ -303,6 +315,20 @@ libs/                       You put KSL.API.dll / UnityEngine.CoreModule.dll her
   path that behaves identically whether you're in Photo Mode or not, rather than special-casing
   each mode. Not yet confirmed against Photo Mode specifically in a real play session (the last
   log capture never entered it) - that's the next thing to verify.
+- **Still no visible movement, specifically confirmed in Kino's own "Custom Camera" mode (the
+  mouse/keyboard-controlled free-look mode), even with 0.3.5's last-write-every-frame fix in
+  place.** Since the diagnostic log rules out both a targeting miss and a losing-the-race-to-write
+  problem, the remaining likely cause is that this camera system sets
+  `Camera.worldToCameraMatrix` explicitly - once that's done, Unity renders using that matrix and
+  ignores the Transform for that camera until `ResetWorldToCameraMatrix()` is called, regardless
+  of how late something else writes to `transform.position`/`rotation`. 0.3.6 rebuilds and
+  re-assigns the view matrix directly every frame instead of relying on the Transform alone. This
+  is inferred, not confirmed - `kino.dll` still can't be inspected directly - so it needs a real
+  retest, specifically in that Custom Camera mode, to know if it worked.
+- **`Unable to save config 'PhoneCam.ksc': NullReferenceException`** appears repeatedly in the
+  logs, correlated with rapid Enabled-toggle/F9/zoom-reset actions. The stack trace is entirely
+  inside KSL's own obfuscated internals, not this mod's code, so there's nothing to fix on this
+  end - flagging it as a known, non-fatal noise source rather than chasing it further.
 - The zoom offset and head-tracking offset both add on top of whatever CarX outputs that
   frame (including its own shake/FOV effects) rather than replacing it — this is deliberate,
   but means extreme zoom + a game effect that also changes FOV heavily could stack oddly.
