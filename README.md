@@ -9,6 +9,24 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.3.18** - The v0.3.17 log confirmed (again) that the offset math and the Transform write are
+both correct: right after calibration, `cameraWorldPosAfterWrite` moved by exactly the magnitude of
+`appliedPosOffset` (rotated into world space by the camera's own facing, as expected from
+`t.position += t.rotation * posOffset`), then later jumped by hundreds of meters the moment the
+joystick connected and the car started driving around the parking/practice area - while
+`appliedPosOffset` stayed under ~0.3m the whole time. So the reported "no movement" is the same
+scale problem as before: a real head-tracking offset of a few tenths of a meter is invisible next
+to the car's own motion once you're actually driving.
+
+Rather than argue the point again, **`PositionSensitivity` is temporarily forced up to 8x**
+(`ApplyDefaultsIfUnset`, was 1x) and its in-game slider range widened from 0-3 to 0-15 to match, so
+the effect is unmistakable at a glance even against a moving scene. This intentionally overrides
+whatever value was saved from a previous session, every load, until it's reverted - it's a
+diagnostic aid, not a permanent tuning change. Once you can positively confirm the camera is moving
+with your real steps (ideally while the car is stationary, or in Photo Mode where the camera holds
+still on its own), say so and this will be dropped back to a normal 1x default that only fills in a
+truly-unset value, same as everything else in that method.
+
 **0.3.17** - Two things this round, both aimed at "I step left, nothing happens":
 
 1. **Every single real-game log this project has produced** - all the way back - repeats

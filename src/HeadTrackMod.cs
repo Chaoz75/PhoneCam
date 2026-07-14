@@ -22,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.3.17", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.3.18", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.3.17";
+		private const string CurrentVersion = "0.3.18";
 
 		private const int DefaultOscPort = 9000;
 
@@ -810,7 +810,20 @@ namespace HeadTrackARKit {
 			// KSL config properties default to each type's zero value on first run - fill in
 			// sane non-zero defaults the first time this mod loads.
 			if (config_.OscPort <= 0) config_.OscPort = DefaultOscPort;
-			if (config_.PositionSensitivity <= 0) config_.PositionSensitivity = 1.0f;
+
+			// 0.3.18: TEMPORARY diagnostic bump, at the user's request, to make the head-tracking
+			// offset visually unmistakable while confirming the offset math/Transform write proven
+			// correct in the v0.3.17 logs actually reads as camera movement on screen (at the
+			// previous ~1-1.5x sensitivity, real steps were only producing ~0.2-0.4m of applied
+			// offset per axis - correct, but subtle against a normal in-game camera). Forces
+			// PositionSensitivity up to 8x every load as long as it's currently below that,
+			// overriding whatever was saved/tuned from a previous session. This is intentionally
+			// NOT a one-time upgrade flag (compare PositionRangeUpgraded below) - it will keep
+			// re-forcing 8x on every load, even if the in-game slider is used to dial it back down
+			// in the meantime, until this line is removed. Once you've confirmed you can actually
+			// see the camera move, say so and this will be reverted to a normal 1.0x default that
+			// only applies on a truly unset (0) value, same as everything else in this method.
+			if (config_.PositionSensitivity < 8.0f) config_.PositionSensitivity = 8.0f;
 			if (config_.RotationSensitivity <= 0) config_.RotationSensitivity = 1.0f;
 			if (config_.PositionSmoothing <= 0) config_.PositionSmoothing = 0.35f;
 			if (config_.RotationSmoothing <= 0) config_.RotationSmoothing = 0.45f;
@@ -977,7 +990,9 @@ namespace HeadTrackARKit {
 			Kino.UI.GroupLabel("Sensitivity");
 
 			float posSens = config_.PositionSensitivity;
-			if (Kino.UI.Slider(ref posSens, 0f, 3f, $"Position sensitivity: {posSens:F2}")) {
+			// 0.3.18: widened from 0-3 to 0-15 to fit the temporary 8x diagnostic default (see
+			// ApplyDefaultsIfUnset) - revert alongside that default once testing confirms things work.
+			if (Kino.UI.Slider(ref posSens, 0f, 15f, $"Position sensitivity: {posSens:F2}")) {
 				config_.PositionSensitivity = posSens;
 				state_.PositionSensitivity = posSens;
 			}
