@@ -9,6 +9,20 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.3.5** - The SRP hook (0.3.4) got the callback firing again, and the diagnostic log confirmed
+`GetActiveCamera()` was correctly resolving to the real render camera - but the offset still had
+no visible effect on the camera view (a dashboard element moved, the outside view didn't). Root
+cause: multicast events like `RenderPipelineManager.beginCameraRendering` call every subscriber in
+registration order, so if CarX/Kino's own camera-follow logic subscribes to the same hook and runs
+*after* this mod's handler, it silently overwrites whatever this mod just set, every frame. Fixed
+two ways: (1) `LateUpdate()` now unsubscribes and immediately re-subscribes both camera hooks every
+single frame, which moves this mod's handler to the end of the invocation list each time - it
+always applies its offset last. (2) Targeting was simplified to stop trying to guess which
+CarX/Kino system currently "owns" the camera; it now applies to whatever camera is actually
+rendering to the screen that frame (skipping only offscreen cameras like reflection probes, and
+orthographic ones like 2D HUD overlays), which is the direct path to a true override that works
+identically in and out of Photo Mode rather than needing separate logic per mode.
+
 **0.3.4** - Found and fixed the real cause of "receiving data + calibrated, but the camera never
 moves": this game runs a Scriptable Render Pipeline (URP/HDRP), and `Camera.onPreCull` - the hook
 this mod relied on since 0.1.0 - is a documented no-op under any SRP, full stop, regardless of
@@ -275,6 +289,20 @@ libs/                       You put KSL.API.dll / UnityEngine.CoreModule.dll her
   equivalent hook, same per-camera/right-before-render timing guarantee as `onPreCull`. Both
   subscriptions are kept active; only the one matching the project's actual pipeline will ever
   call back, so this doesn't need to guess which one applies.
+- **Even with the SRP hook firing and resolving the correct camera, the offset had no visible
+  effect on the camera view (0.3.4 real-game test).** Cause: multicast events invoke subscribers
+  in registration order - if CarX/Kino's own camera logic also subscribes to
+  `beginCameraRendering`/`onPreCull` and runs *after* this mod's handler in a given frame, it
+  overwrites whatever this mod just set, silently, every frame. Fixed in 0.3.5 by having
+  `LateUpdate()` unsubscribe-then-resubscribe both hooks every single frame, which always moves
+  this mod's handler to the end of the invocation list - it now applies its offset last, no
+  matter what else is also touching the camera that frame. Targeting was also simplified at the
+  same time: rather than asking CarX/Kino which system currently "owns" the camera, it now applies
+  to whichever camera is actually rendering on-screen that frame (skipping only offscreen cameras
+  like reflection probes and orthographic ones like 2D HUD overlays) - the goal being one code
+  path that behaves identically whether you're in Photo Mode or not, rather than special-casing
+  each mode. Not yet confirmed against Photo Mode specifically in a real play session (the last
+  log capture never entered it) - that's the next thing to verify.
 - The zoom offset and head-tracking offset both add on top of whatever CarX outputs that
   frame (including its own shake/FOV effects) rather than replacing it — this is deliberate,
   but means extreme zoom + a game effect that also changes FOV heavily could stack oddly.

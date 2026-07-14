@@ -22,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.3.4", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.3.5", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.3.4";
+		private const string CurrentVersion = "0.3.5";
 
 		private const int DefaultOscPort = 9000;
 
@@ -177,6 +177,23 @@ namespace HeadTrackARKit {
 			}
 		}
 
+		private void LateUpdate() {
+			// A C# multicast event invokes its subscribers in registration order. Unsubscribing
+			// then immediately re-subscribing moves this mod's handler to the END of that list,
+			// which means it runs after anything else that also touches the camera this frame -
+			// including CarX's own follow-cam logic and Kino's custom camera system in Photo Mode.
+			// Without this, whichever of us happened to subscribe first would have its change to
+			// the camera transform silently discarded by whichever subscribed after - which is
+			// the likely reason the offset wasn't visibly affecting the camera view even once the
+			// SRP hook itself started firing correctly (0.3.4). Doing this every frame (rather
+			// than once in Start()) means it keeps winning even if something else re-subscribes
+			// itself later, e.g. when Kino swaps its own custom camera in/out of Photo Mode.
+			Camera.onPreCull -= OnCameraPreCull;
+			Camera.onPreCull += OnCameraPreCull;
+			RenderPipelineManager.beginCameraRendering -= OnBeginCameraRendering;
+			RenderPipelineManager.beginCameraRendering += OnBeginCameraRendering;
+		}
+
 		private void AdjustZoom(float deltaDegrees) {
 			float max = Mathf.Abs(config_.MaxZoomOffset);
 			zoomOffsetDegrees_ = Mathf.Clamp(zoomOffsetDegrees_ + deltaDegrees, -max, max);
@@ -235,7 +252,18 @@ namespace HeadTrackARKit {
 			LogCameraDiagnostics(cam);
 
 			if (!config_.Enabled) return;
-			if (cam != GetActiveCamera()) return;
+
+			// 0.3.4's real fix (SRP hook) proved the plumbing works: GetActiveCamera() correctly
+			// resolved to the actual render camera the whole session. But the goal now is a
+			// free-cam-style override that works in *every* mode CarX/Kino can be in, including
+			// Photo Mode, without needing to special-case each one - so instead of trusting
+			// CameraSwitch/UIPhotoModeContext to say which camera is "the" camera, just apply to
+			// whichever camera Unity is actually about to render to the screen. `cam` here already
+			// is exactly that, every time this fires - the only cameras to skip are ones that
+			// obviously aren't the player's view: anything rendering to an offscreen buffer
+			// (targetTexture != null - reflection probes, minimap, icon generation, etc.) or an
+			// orthographic camera (2D HUD/UI overlays, if this game has any as separate cameras).
+			if (cam.targetTexture != null || cam.orthographic) return;
 
 			// Zoom applies independently of head-tracking calibration.
 			if (zoomOffsetDegrees_ != 0f) {
@@ -297,9 +325,11 @@ namespace HeadTrackARKit {
 		}
 
 		/// <summary>
-		/// The camera to apply the head-track/zoom offset to this frame, resolved in three
-		/// layers so it works across every camera mode CarX has, not just whichever one happens
-		/// to be tagged "MainCamera":
+		/// No longer used to gate whether the offset gets applied (see the comment in
+		/// <see cref="OnCameraPreCull"/> for why - as of 0.3.5 that's decided per-camera by
+		/// whether it renders on-screen at all, not by which system CarX/Kino currently considers
+		/// "active"). Kept purely for the diagnostic heartbeat log, since it's still useful to see
+		/// what this resolves to compared to what's actually rendering:
 		///
 		/// 1. <c>CameraSwitch.instance.FindActiveCamera()</c> - confirmed via direct inspection
 		///    of Assembly-CSharp.dll's metadata: <c>CameraSwitch</c> is CarX's own public
