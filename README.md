@@ -9,6 +9,29 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.3.19** - Fixed a real regression: shadows disappearing and severe motion blur (even while
+completely stationary) the moment the mod was enabled, reported from an online session.
+Root cause: `ApplyCameraOverride` - which manually reassigns
+`Camera.worldToCameraMatrix`/`projectionMatrix`/`cullingMatrix` every frame to fight Kino's Custom
+Camera mode possibly freezing those matrices in Photo Mode - was running unconditionally on every
+frame the mod was Enabled, regardless of whether there was any actual head-tracking offset or zoom
+to apply. The old comment argued this was a visual no-op since the resulting matrix *values* are
+mathematically identical to Unity's defaults when nothing else is customizing them - true for the
+values, but not for the act of assigning them: setting `Camera.projectionMatrix` at all switches
+the camera into a "custom projection" mode that disables the render pipeline's own per-frame TAA
+jitter and temporal motion-vector bookkeeping, so reassigning a clean matrix every frame forever
+looks to the motion-vector pass like the camera is constantly moving - exactly "motion blur while
+standing still." The same override's `cullingMatrix` feeds cascaded shadow culling, and a custom
+culling matrix that doesn't precisely match what the shadow pass expects can cull shadow-casters
+out of the shadow map entirely - "shadows disappear."
+
+Fixed by only calling `ApplyCameraOverride` on frames where there's a real zoom or head-tracking
+offset large enough to matter (a tiny epsilon check on both), and calling `ResetCameraOverride`
+otherwise - handing the camera fully back to Unity's normal automatic matrix derivation whenever
+this mod isn't actually changing anything about it. This should restore normal shadows/TAA any
+time you're centered/not actively leaning or zooming, and only re-engage the override during
+active head movement or a zoom adjustment.
+
 **0.3.18** - The v0.3.17 log confirmed (again) that the offset math and the Transform write are
 both correct: right after calibration, `cameraWorldPosAfterWrite` moved by exactly the magnitude of
 `appliedPosOffset` (rotated into world space by the camera's own facing, as expected from

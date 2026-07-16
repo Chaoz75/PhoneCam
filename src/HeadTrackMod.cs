@@ -22,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.3.18", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.3.19", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.3.18";
+		private const string CurrentVersion = "0.3.19";
 
 		private const int DefaultOscPort = 9000;
 
@@ -369,7 +369,8 @@ namespace HeadTrackARKit {
 			if (cam.targetTexture != null || cam.orthographic) return;
 
 			// Zoom applies independently of head-tracking calibration.
-			if (Mathf.Abs(zoomCurrentDegrees_) > 0.001f) {
+			bool hasZoom = Mathf.Abs(zoomCurrentDegrees_) > 0.001f;
+			if (hasZoom) {
 				cam.fieldOfView = Mathf.Clamp(cam.fieldOfView + zoomCurrentDegrees_, 1f, 179f);
 			}
 
@@ -385,6 +386,7 @@ namespace HeadTrackARKit {
 			// rendered from a separately-computed pose, which is what "acting weird" actually was.
 			// Writing to the real Transform/FOV keeps every such system in sync automatically,
 			// exactly like it did before 0.3.7.
+			bool hasPoseOffset = false;
 			if (state_.IsCalibrated) {
 				Vector3 posOffset = state_.GetPositionOffset();
 				Quaternion rotOffset = FixLookDirection(state_.GetRotationOffsetEuler());
@@ -396,6 +398,12 @@ namespace HeadTrackARKit {
 				}
 
 				lastAppliedPosOffset_ = posOffset;
+
+				// 0.3.19: only counts as a real offset worth fighting Kino's camera matrix over
+				// (see the ApplyCameraOverride/ResetCameraOverride choice below) if it's actually
+				// large enough to matter - a sub-millimeter/sub-degree residual left over from
+				// smoothing shouldn't be enough to flip that decision every other frame.
+				hasPoseOffset = posOffset.sqrMagnitude > 1e-6f || Quaternion.Angle(rotOffset, Quaternion.identity) > 0.01f;
 
 				t.position += t.rotation * posOffset;
 				t.rotation = t.rotation * rotOffset;
@@ -409,20 +417,35 @@ namespace HeadTrackARKit {
 				lastCameraWorldPosAfterWrite_ = t.position;
 			}
 
-			// Rebuild and reassign the view AND projection matrices explicitly, every frame this
-			// mod is enabled - regardless of calibration, so zoom alone (before F9 is ever
-			// pressed) reaches the render too. Two separate Unity gotchas this works around:
-			// (1) Kino's Custom Camera mode sets Camera.worldToCameraMatrix explicitly (0.3.6),
-			// which makes Unity stop deriving the view from the Transform - rebuilding it from the
-			// (now-offset) Transform every frame wins regardless. (2) The zoom-not-working report
-			// points at the same thing happening to Camera.projectionMatrix: fieldOfView changes
-			// were clearly reaching *something* (the gauge Canvas visibly reacted to them), but
-			// never the actual rendered view - consistent with Kino also freezing the projection
-			// matrix independent of fieldOfView. Rebuilding it from fieldOfView explicitly, every
-			// frame, guarantees the render matches whatever FOV was just set. Both are
-			// mathematically identical to Unity's own defaults when nothing else is customizing
-			// them, so this is a no-op visually anywhere Kino isn't fighting it.
-			ApplyCameraOverride(cam);
+			// 0.3.19: root-caused the "shadows disappear and motion blur goes crazy the instant
+			// the mod is enabled - even standing still" report. ApplyCameraOverride used to run
+			// unconditionally, every single frame this mod was Enabled, on the theory (see its old
+			// comment, now below) that manually reassigning Camera.worldToCameraMatrix/
+			// projectionMatrix/cullingMatrix was a visual no-op whenever nothing else was
+			// customizing them, since the *values* would come out mathematically identical to
+			// Unity's own defaults. That's true for the values, but not for the side effects of the
+			// assignment itself: setting Camera.projectionMatrix at all switches the camera into
+			// Unity's "custom projection" mode, which turns off the render pipeline's own per-frame
+			// TAA projection jitter and the temporal motion-vector bookkeeping that depends on
+			// comparing this frame's pipeline-managed matrix against last frame's. Reassigning a
+			// clean, non-jittered matrix every single frame forever looks to the motion-vector pass
+			// like the camera never stops moving, even standing dead still - that's the "crazy
+			// motion blur" report exactly. The same override's cullingMatrix feeds cascaded shadow
+			// culling too; a custom culling matrix that doesn't exactly match what the shadow pass
+			// expects can cull shadow-casting geometry out of the shadow map entirely, matching
+			// "shadow disappears."
+			//
+			// The whole reason this override exists (see ApplyCameraOverride's doc comment) is to
+			// win against Kino's Custom Camera mode possibly re-freezing the matrix in Photo Mode -
+			// there's nothing to win when this mod isn't currently changing anything about the
+			// camera, so only fight for the matrices on frames where there's a real offset or zoom
+			// to enforce, and hand the camera fully back to Unity's normal automatic derivation
+			// (via ResetCameraOverride) the rest of the time.
+			if (hasZoom || hasPoseOffset) {
+				ApplyCameraOverride(cam);
+			} else {
+				ResetCameraOverride(cam);
+			}
 		}
 
 		/// <summary>
