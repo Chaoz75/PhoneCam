@@ -32,6 +32,23 @@ this mod isn't actually changing anything about it. This should restore normal s
 time you're centered/not actively leaning or zooming, and only re-engage the override during
 active head movement or a zoom adjustment.
 
+Also reported in the same session: leaning/stepping toward the car (e.g. toward the trunk) made
+body panels - the trunk lid, rear glass - disappear entirely. This is very likely CarX's own
+proximity-based hide-geometry-near-camera system (common in racing games, to avoid rendering the
+backfaces of a panel the camera has clipped inside of), not a bug introduced by this mod - and it
+firing at all is actually confirmation that translation is really reaching the render. The 0.3.18
+diagnostic bump (forced 8x sensitivity, up to 15x via the slider, so translation would be
+unmistakable for testing) is the direct cause of *how easily* it triggered: a real ~0.3-0.6m
+lean/step was landing as several *meters* of applied camera offset at that sensitivity - far
+outside where a camera would ever normally sit relative to the car, and easily crossing whatever
+distance threshold that hide system uses. Reverted `PositionSensitivity`'s default back to a normal
+1x (from the forced 8x) and the in-game slider range back to 0-3 (from 0-15), now that translation
+is confirmed working and the diagnostic bump has done its job. If panels still disappear at normal
+1x sensitivity when genuinely walking close to the car, that's worth a follow-up test: check
+whether CarX's own native Photo Mode free-camera does the same thing when brought that close to the
+trunk - if it does, that confirms this is inherent base-game behavior outside this mod's control,
+not something fixable from here.
+
 **0.3.18** - The v0.3.17 log confirmed (again) that the offset math and the Transform write are
 both correct: right after calibration, `cameraWorldPosAfterWrite` moved by exactly the magnitude of
 `appliedPosOffset` (rotated into world space by the camera's own facing, as expected from

@@ -834,19 +834,17 @@ namespace HeadTrackARKit {
 			// sane non-zero defaults the first time this mod loads.
 			if (config_.OscPort <= 0) config_.OscPort = DefaultOscPort;
 
-			// 0.3.18: TEMPORARY diagnostic bump, at the user's request, to make the head-tracking
-			// offset visually unmistakable while confirming the offset math/Transform write proven
-			// correct in the v0.3.17 logs actually reads as camera movement on screen (at the
-			// previous ~1-1.5x sensitivity, real steps were only producing ~0.2-0.4m of applied
-			// offset per axis - correct, but subtle against a normal in-game camera). Forces
-			// PositionSensitivity up to 8x every load as long as it's currently below that,
-			// overriding whatever was saved/tuned from a previous session. This is intentionally
-			// NOT a one-time upgrade flag (compare PositionRangeUpgraded below) - it will keep
-			// re-forcing 8x on every load, even if the in-game slider is used to dial it back down
-			// in the meantime, until this line is removed. Once you've confirmed you can actually
-			// see the camera move, say so and this will be reverted to a normal 1.0x default that
-			// only applies on a truly unset (0) value, same as everything else in this method.
-			if (config_.PositionSensitivity < 8.0f) config_.PositionSensitivity = 8.0f;
+			// 0.3.19: the 0.3.18 diagnostic bump (forced 8x, up to 15x via the widened slider) did
+			// its job - it's what made translation visible enough to expose the real find (parts of
+			// the car, e.g. the trunk/rear glass, disappearing when the camera got close: CarX's own
+			// proximity-based hide-geometry-near-camera system, not a bug in this mod - see the
+			// README). At that sensitivity, a real ~0.3-0.6m lean/step was landing as multiple
+			// *meters* of applied offset, which is far outside where a normal photo-mode camera
+			// would ever sit relative to the car, and easily crosses whatever distance threshold
+			// that hide system uses. Reverted back to a normal 1x default now that confirmation is
+			// done, same as every other numeric default here: only fills in a truly unset (0) value,
+			// doesn't fight a value you've already tuned.
+			if (config_.PositionSensitivity <= 0) config_.PositionSensitivity = 1.0f;
 			if (config_.RotationSensitivity <= 0) config_.RotationSensitivity = 1.0f;
 			if (config_.PositionSmoothing <= 0) config_.PositionSmoothing = 0.35f;
 			if (config_.RotationSmoothing <= 0) config_.RotationSmoothing = 0.45f;
@@ -1013,9 +1011,12 @@ namespace HeadTrackARKit {
 			Kino.UI.GroupLabel("Sensitivity");
 
 			float posSens = config_.PositionSensitivity;
-			// 0.3.18: widened from 0-3 to 0-15 to fit the temporary 8x diagnostic default (see
-			// ApplyDefaultsIfUnset) - revert alongside that default once testing confirms things work.
-			if (Kino.UI.Slider(ref posSens, 0f, 15f, $"Position sensitivity: {posSens:F2}")) {
+			// 0.3.19: reverted the 0.3.18 diagnostic widening (0-15, to fit the temporary 8x
+			// forced default) back to 0-3 now that the default itself is back to 1x - see
+			// ApplyDefaultsIfUnset. 3x is still enough headroom to make a small real lean feel
+			// dramatic without being able to fling the camera meters away from a normal seated
+			// position.
+			if (Kino.UI.Slider(ref posSens, 0f, 3f, $"Position sensitivity: {posSens:F2}")) {
 				config_.PositionSensitivity = posSens;
 				state_.PositionSensitivity = posSens;
 			}
