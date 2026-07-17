@@ -9,6 +9,15 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.3.26** - Fixed a real "can't edit the LAN IP field at all" report. The "Show IP addresses"
+toggle that unlocks editing both the LAN IP and Phone IP fields used to live several sections
+further down the settings panel, under a separate "Privacy" heading, past the Phone IP field too -
+so on first glance the LAN IP field just looked like a plain, non-interactive masked label with no
+visible way to edit it, not a field gated behind a toggle that hadn't been scrolled to yet. The
+toggle is now shown immediately above the fields it controls, labeled "Show IP addresses (required
+to edit them)" so it's unambiguous. The Privacy section further down still explains why the
+masking exists, just without a second, redundant copy of the toggle.
+
 **0.3.25** - Free-cam rework, replacing the "add offset onto the game's camera" approach entirely.
 
 Every version through 0.3.24 wrote the tracked offset as an increment on top of whatever CarX's

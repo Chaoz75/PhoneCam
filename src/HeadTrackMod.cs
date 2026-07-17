@@ -22,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.3.25", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.3.26", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.3.25";
+		private const string CurrentVersion = "0.3.26";
 
 		private const int DefaultOscPort = 9000;
 
@@ -1124,6 +1124,17 @@ namespace HeadTrackARKit {
 				}
 			}
 
+			// 0.3.26: fixes a real "can't edit the LAN IP at all" report. The toggle that unlocks
+			// editing both IP fields below used to live several sections further down the page
+			// (under a separate "Privacy" heading, past the Phone's IP field too) - so on first
+			// glance the LAN IP field just looked like a plain, non-interactive masked label with
+			// no visible way to edit it at all, not a field gated behind a toggle you hadn't
+			// scrolled to yet. Moved the toggle to right here, immediately above the fields it
+			// actually controls, with a label that says outright what it's for.
+			if (Kino.UI.Toggle("Show IP addresses (required to edit them)", ref showSensitive)) {
+				config_.ShowSensitiveInfo = showSensitive;
+			}
+
 			Kino.UI.Label("This PC's LAN IP (edit if auto-detect picked the wrong adapter):");
 			if (showSensitive) {
 				if (Kino.UI.Input(ref localIpText_, 45, "^[0-9a-fA-F:.]{0,45}$")) {
@@ -1131,7 +1142,7 @@ namespace HeadTrackARKit {
 				}
 			}
 			else {
-				Kino.UI.Label($"  {MaskAddress(localIpText_)}  (enable 'Show IP addresses' below to view/edit)");
+				Kino.UI.Label($"  {MaskAddress(localIpText_)}  (enable 'Show IP addresses' above to edit)");
 			}
 			Kino.UI.Label("Type the IP above and the port above into LOTA's Transmission Settings destination IP.");
 			if (Kino.UI.Button("Refresh IP (auto-detect)")) {
@@ -1146,7 +1157,7 @@ namespace HeadTrackARKit {
 				}
 			}
 			else if (!string.IsNullOrEmpty(phoneIpText_)) {
-				Kino.UI.Label($"  {MaskAddress(phoneIpText_)}  (enable 'Show IP addresses' below to view/edit)");
+				Kino.UI.Label($"  {MaskAddress(phoneIpText_)}  (enable 'Show IP addresses' above to edit)");
 			}
 			else {
 				Kino.UI.Label("  (not set)");
@@ -1154,10 +1165,7 @@ namespace HeadTrackARKit {
 
 			Kino.UI.HorizontalLine();
 			Kino.UI.GroupLabel("Privacy");
-			Kino.UI.Label("Off by default - masks IP addresses above so they aren't exposed on stream or in screenshots.");
-			if (Kino.UI.Toggle("Show IP addresses", ref showSensitive)) {
-				config_.ShowSensitiveInfo = showSensitive;
-			}
+			Kino.UI.Label("IP addresses above are masked by default so they aren't exposed on stream or in screenshots - use the 'Show IP addresses' toggle further up to view or edit them.");
 
 			Kino.UI.HorizontalLine();
 			Kino.UI.GroupLabel("Look direction");
