@@ -9,6 +9,34 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.3.27** - Reverts the 0.3.25 free-cam rework's core mechanism after a real report of the camera
+"not working" following calibration. Root cause: 0.3.25 anchored the camera to a fixed WORLD-SPACE
+position/rotation captured at the moment of F9, then rebuilt the camera's entire pose from that
+fixed anchor plus the tracked delta every frame - completely replacing whatever CarX's own camera
+logic wanted to do. That successfully removed the "tracked movement fighting a moving baseline"
+feeling, but a fixed world anchor has no idea the car ever moves: drive away from wherever you
+calibrated and the camera just sits there in empty space, watching the car leave. F9 itself was
+never broken (confirmed in the report's own log - three separate successful "Neutral position set"
+events, each locking a sane anchor) - what broke was what F9 now caused: a camera that no longer
+follows the car at all.
+
+Reverted the pose write-back in `OnCameraPreCull` to the additive approach (offset added onto
+whatever CarX's own camera computed for that exact frame, same as every version through 0.3.24) -
+CarX's own camera logic goes back to doing 100% of "follow the car" for free, this mod only
+perturbs its result on top. `Calibrate()` goes back to only setting the phone's neutral pose, not
+capturing a camera anchor. The `anchorPosition_`/`anchorRotation_` fields are removed.
+
+Explicitly NOT reverted, since these were independently correct and unrelated to the regression:
+the Photo-Mode-only scoping for `ApplyCameraOverride` (0.3.25's actual fix for the shadow-flicker
+root cause, no more hysteresis) stays, as does `ApplyClippingGuard`'s more general
+position/rotation-parameter signature (now just called with the live camera Transform's
+position/rotation again instead of an anchor).
+
+A properly car-relative free cam (anchored to the car's own Transform instead of world space,
+so it would translate/rotate along with the car while still being decoupled from CarX's own
+per-frame camera jitter) remains a real potential future improvement - it just needs the car's
+actual Transform reference identified first, rather than shipping another guess.
+
 **0.3.26** - Fixed a real "can't edit the LAN IP field at all" report. The "Show IP addresses"
 toggle that unlocks editing both the LAN IP and Phone IP fields used to live several sections
 further down the settings panel, under a separate "Privacy" heading, past the Phone IP field too -

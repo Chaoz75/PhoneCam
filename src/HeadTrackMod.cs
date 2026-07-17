@@ -22,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.3.26", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.3.27", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.3.26";
+		private const string CurrentVersion = "0.3.27";
 
 		private const int DefaultOscPort = 9000;
 
@@ -116,13 +116,6 @@ namespace HeadTrackARKit {
 		private float zoomTargetDegrees_;
 		private float zoomCurrentDegrees_;
 
-		// 0.3.25: free-cam anchor - the camera's full world position/rotation at the moment of
-		// the last F9 calibration. See Calibrate() and OnCameraPreCull's doc comment for why the
-		// camera's pose is now built entirely from this fixed anchor plus the live tracked
-		// offset, instead of adding the offset onto whatever CarX's own camera logic computes
-		// each frame (the old 0.3.8-0.3.24 approach).
-		private Vector3 anchorPosition_;
-		private Quaternion anchorRotation_ = Quaternion.identity;
 
 		// 0.3.23: see CheckOscSignalHealth's doc comment - a real log showed incomingPos AND
 		// incomingEuler both frozen at identical values for 48+ straight seconds, meaning LOTA
@@ -406,15 +399,10 @@ namespace HeadTrackARKit {
 		}
 
 		/// <summary>
-		/// 0.3.25: as of the free-cam rework (see OnCameraPreCull's doc comment), calibrating
-		/// does two things instead of one: it still sets the phone's neutral pose (state_.Calibrate,
-		/// unchanged), and it now ALSO locks in <see cref="anchorPosition_"/>/
-		/// <see cref="anchorRotation_"/> - the camera's exact world position/rotation at this
-		/// instant, read from whatever camera GetActiveCamera() currently resolves to. From this
-		/// point on, the camera's entire pose is this fixed anchor plus your live tracked
-		/// movement - not an offset blended onto whatever CarX's own camera logic happens to be
-		/// doing that frame. Re-press F9 any time you want to re-anchor (e.g. after switching
-		/// camera modes, or repositioning in your seat).
+		/// 0.3.27: back to setting only the phone's neutral pose - see OnCameraPreCull's doc
+		/// comment for why 0.3.25's "also lock a fixed world-space camera anchor here" idea got
+		/// reverted (it broke the camera following the car at all, which is worse than the
+		/// problem it was trying to fix).
 		/// </summary>
 		private void Calibrate() {
 			if (!state_.HasSignal) {
@@ -422,16 +410,8 @@ namespace HeadTrackARKit {
 				return;
 			}
 
-			Camera anchorCam = GetActiveCamera();
-			if (anchorCam != null) {
-				anchorPosition_ = anchorCam.transform.position;
-				anchorRotation_ = anchorCam.transform.rotation;
-			}
-
 			state_.Calibrate();
-			Kino.Log.Info(
-				$"[HeadTrackARKit] Neutral position set - camera anchor locked at {FormatVector(anchorPosition_)} " +
-				$"on camera '{(anchorCam != null ? anchorCam.name : "none found")}'.");
+			Kino.Log.Info("[HeadTrackARKit] Neutral position set.");
 		}
 
 		private void OnCameraPreCull(Camera cam) {
@@ -468,44 +448,46 @@ namespace HeadTrackARKit {
 				cam.fieldOfView = Mathf.Clamp(cam.fieldOfView + zoomCurrentDegrees_, 1f, 179f);
 			}
 
-			// 0.3.25: FREE CAM rework. Every version through 0.3.24 wrote the tracked offset as an
-			// INCREMENT on top of whatever CarX's own camera logic had just computed for this
-			// exact frame (t.position += t.rotation * posOffset) - meaning your tracked movement
-			// was always being blended onto a live, independently-moving target (chase cam sways
-			// with the car, cockpit cam has its own settle/shake behavior, etc.), not a fixed
-			// point. That's a big part of why translation never felt like real tracking: it WAS
-			// being applied correctly (proven repeatedly via lastCameraWorldPosAfterWrite/
-			// endOfRender diagnostics), it was just constantly fighting a moving baseline instead
-			// of sitting on a stable one.
+			// 0.3.8: writes the head-tracking offset onto the camera's real Transform, added on
+			// top of whatever CarX's own camera logic just computed for `cam` this exact frame.
+			// This is what makes the camera keep following the car normally - chase cam still
+			// follows the car around the track, cockpit cam still stays glued to the seat - with
+			// your tracked movement layered on top of that, not replacing it.
 			//
-			// Now the camera's pose is built ENTIRELY from a fixed anchor (see
-			// anchorPosition_/anchorRotation_, locked in by Calibrate() at F9) plus the live
-			// tracked delta - CarX's own per-frame camera computation for `cam` is completely
-			// ignored, not blended with. This is the same idea as how Photo Mode's own free
-			// camera already works: fully decoupled from gameplay camera logic, driven only by
-			// input (in this case, your phone).
+			// 0.3.25 briefly replaced this with a fixed WORLD-SPACE anchor: camera position/
+			// rotation captured once at F9, then every frame rebuilt from that fixed anchor plus
+			// the tracked delta, completely ignoring CarX's own per-frame camera computation. The
+			// goal was removing the "tracked movement fighting a moving baseline" feeling (chase
+			// cam sways with the car, cockpit cam has its own settle/shake) - but a fixed WORLD
+			// anchor doesn't know the car ever moves: drive away from wherever you calibrated and
+			// the camera just sits there in empty space, watching the car leave. That's what
+			// "camera isn't working" turned out to mean, and it's strictly worse than the
+			// "fighting a moving baseline" problem it was trying to solve. Reverted back to the
+			// additive approach here - CarX's own camera logic still does 100% of "follow the
+			// car" for free, this mod only perturbs its result. A properly car-relative free cam
+			// (anchored to the car's own Transform instead of world space) is a real potential
+			// future improvement, but needs the car's actual Transform reference identified first
+			// rather than shipping another guess.
 			if (state_.IsCalibrated) {
 				Vector3 posOffset = state_.GetPositionOffset();
 				Quaternion rotOffset = FixLookDirection(state_.GetRotationOffsetEuler());
 
+				Transform t = cam.transform;
+
 				if (config_.ClippingGuardEnabled && posOffset.sqrMagnitude > 1e-6f) {
-					// Raycasts from the anchor, not the camera's current (about-to-be-overwritten)
-					// Transform - the anchor is the real "where would the camera be without your
-					// lean" reference point now.
-					posOffset = ApplyClippingGuard(anchorPosition_, anchorRotation_, posOffset);
+					posOffset = ApplyClippingGuard(t.position, t.rotation, posOffset);
 				}
 
 				lastAppliedPosOffset_ = posOffset;
 
-				Transform t = cam.transform;
-				t.position = anchorPosition_ + anchorRotation_ * posOffset;
-				t.rotation = anchorRotation_ * rotOffset;
+				t.position += t.rotation * posOffset;
+				t.rotation = t.rotation * rotOffset;
 
 				// 0.3.17: ground-truth check for the "stepping left does nothing" report - logs
 				// the camera's ACTUAL world position right after this mod wrote to it, so a test
-				// log shows directly whether the Transform write itself is taking effect. Still
-				// useful post-0.3.25: if this doesn't match anchorPosition_ + the expected offset,
-				// something downstream overwrote the Transform again before the frame rendered.
+				// log shows directly whether the Transform write itself is taking effect, as
+				// opposed to something else (e.g. CarX/Kino's own follow-cam logic) overwriting it
+				// again before the frame actually renders.
 				lastCameraWorldPosAfterWrite_ = t.position;
 			}
 
@@ -609,11 +591,11 @@ namespace HeadTrackARKit {
 		}
 
 		/// <summary>
-		/// Raycasts from the free-cam anchor (<paramref name="originPosition"/>/
-		/// <paramref name="originRotation"/> - see anchorPosition_/anchorRotation_, the
-		/// pre-offset reference point as of the 0.3.25 free-cam rework) along the direction of
-		/// the desired head-offset, and clamps the offset short of anything it hits. Prevents the
-		/// tracked camera from poking through the dashboard/seat/window when leaning in.
+		/// Raycasts from <paramref name="originPosition"/>/<paramref name="originRotation"/> -
+		/// the camera's current (pre-offset) position/rotation for this frame - along the
+		/// direction of the desired head-offset, and clamps the offset short of anything it hits.
+		/// Prevents the tracked camera from poking through the dashboard/seat/window when leaning
+		/// in.
 		///
 		/// This is off by default (see IHeadTrackConfig.ClippingGuardEnabled) - it needs the
 		/// layer mask tuned against CarX's actual cockpit collision geometry, which isn't
@@ -1304,9 +1286,9 @@ namespace HeadTrackARKit {
 
 			Kino.UI.HorizontalLine();
 			Kino.UI.GroupLabel("Using it");
-			Kino.UI.Label("Sit in your normal position, then press F9 to lock the camera there as your anchor.");
-			Kino.UI.Label("From that point the camera is a true free cam driven entirely by your phone - it no longer follows the game's own camera.");
-			Kino.UI.Label("Re-press F9 any time you want to re-anchor (after shifting position or switching camera modes).");
+			Kino.UI.Label("Sit in your normal position, then press F9 to set neutral - everything after is relative to that pose.");
+			Kino.UI.Label("The camera still follows the game normally (car, chase cam, cockpit, etc.) - your tracked movement is layered on top of it.");
+			Kino.UI.Label("Re-press F9 any time you shift position.");
 			Kino.UI.Label("Mouse wheel or +/- zooms the camera; F10 resets zoom.");
 			Kino.UI.Label("Leaning/walking moves the camera too - raise 'Max position offset' in Sensitivity/Safety clamps for bigger, room-scale movement.");
 			Kino.UI.Label("Looking/turning fully around (pitch and yaw) has no stopping point - only roll is limited by the safety clamp.");
