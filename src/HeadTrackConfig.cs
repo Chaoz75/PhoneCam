@@ -47,6 +47,21 @@ namespace HeadTrackARKit {
 		bool SensitivityDiagnosticReverted { get; set; }
 
 		/// <summary>
+		/// One-time migration flag, same pattern as <see cref="SensitivityDiagnosticReverted"/>.
+		/// Real in-game testing after 0.3.21's diagnostics proved position offsets really do
+		/// reach the screen every frame, exactly as computed - the "stepping does nothing"
+		/// report turned out to be a magnitude/perception issue, not a bug: at 1x, a real seated
+		/// lean (tens of centimeters) maps to the same tiny real-meter shift in-game, which is
+		/// often too small a parallax to consciously register, especially viewed from chase-cam
+		/// distance. The very first time this loads on 0.3.22+, PositionSensitivity gets bumped
+		/// from 1x up to 2.5x regardless of whatever value is currently saved (a plain
+		/// "&lt;= 0" unset check can't catch an already-set 1.0 value, same reasoning as
+		/// SensitivityDiagnosticReverted). After that one bump this is never touched again, so
+		/// tuning the slider afterward always sticks.
+		/// </summary>
+		bool PositionSensitivityBoosted { get; set; }
+
+		/// <summary>
 		/// Max roll offset, in degrees, applied after sensitivity scaling. As of 0.3.11 this only
 		/// clamps roll (tilting your head sideways) - pitch (up/down) and yaw (left/right) are left
 		/// unclamped so a full real-world 360-degree turn keeps rotating the camera continuously

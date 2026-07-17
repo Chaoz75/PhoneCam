@@ -22,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.3.21", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.3.22", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.3.21";
+		private const string CurrentVersion = "0.3.22";
 
 		private const int DefaultOscPort = 9000;
 
@@ -115,6 +115,11 @@ namespace HeadTrackARKit {
 		// every frame (see Update()) so zoom feels smooth instead of snapping instantly.
 		private float zoomTargetDegrees_;
 		private float zoomCurrentDegrees_;
+
+		// 0.3.22: fixes reported shadow flicker - see the doc comment at the ApplyCameraOverride/
+		// ResetCameraOverride decision in OnCameraPreCull for the mechanism.
+		private float lastRealOffsetTime_ = float.NegativeInfinity;
+		private const float OverrideHysteresisSeconds = 0.3f;
 
 		// --- In-game updater ---
 		// Checks GitHub Releases directly (not KSL's own updater, which only runs at game
@@ -450,7 +455,26 @@ namespace HeadTrackARKit {
 			// camera, so only fight for the matrices on frames where there's a real offset or zoom
 			// to enforce, and hand the camera fully back to Unity's normal automatic derivation
 			// (via ResetCameraOverride) the rest of the time.
+			//
+			// 0.3.22: that raw hasZoom||hasPoseOffset check is exactly what caused the newly
+			// reported shadow *flickering* (distinct from the earlier full shadow-disappearing
+			// bug this same conditional was built to fix). Natural hand/phone jitter constantly
+			// crosses the tiny epsilon threshold inside GetPositionOffset/hasPoseOffset many times
+			// a second around a calibrated center point, so the code was flipping between
+			// ApplyCameraOverride's custom matrices and Unity's automatic ones every other frame -
+			// each flip is itself a discontinuity the shadow/TAA passes can react to, which reads
+			// as flicker rather than the smooth "always on" or "always off" state either mode is
+			// fine at individually. Fixed with a simple time-based hysteresis: once a real offset
+			// is seen, stay in override mode for a short window (OverrideHysteresisSeconds)
+			// afterward instead of re-deciding fresh every single frame, so brief jitter around
+			// the threshold can't cause rapid mode-switching - only a genuine, sustained return to
+			// "nothing to apply" (phone held still at the calibrated neutral point) drops back to
+			// ResetCameraOverride.
 			if (hasZoom || hasPoseOffset) {
+				lastRealOffsetTime_ = Time.unscaledTime;
+			}
+			bool withinHysteresisWindow = Time.unscaledTime - lastRealOffsetTime_ < OverrideHysteresisSeconds;
+			if (withinHysteresisWindow) {
 				ApplyCameraOverride(cam);
 			} else {
 				ResetCameraOverride(cam);
@@ -902,6 +926,23 @@ namespace HeadTrackARKit {
 				config_.PositionSensitivity = 1.0f;
 				config_.SensitivityDiagnosticReverted = true;
 			}
+
+			// 0.3.22: the 0.3.21 endOfRender diagnostic came back conclusive - a real log showed
+			// appliedPosOffset and cameraWorldPosAfterWrite tracking each other exactly, and
+			// endOfRender's transformPos/matrixDecodedPos matching that value down to the
+			// centimeter, every frame. The position write is correct and genuinely reaches the
+			// screen; the "stepping does nothing" report is a magnitude/perception problem, not a
+			// missing/broken write. At 1x, a real seated lean (tens of centimeters) produces the
+			// same tiny real-meter shift in-game, which barely registers as parallax - especially
+			// from chase-cam distance, where the camera already sits several meters from the car.
+			// Bumps PositionSensitivity to 2.5x exactly once via a dedicated migration flag (same
+			// pattern as SensitivityDiagnosticReverted just above - a plain "<= 0" unset check
+			// can't catch the already-set 1.0 that fix left behind).
+			if (!config_.PositionSensitivityBoosted) {
+				config_.PositionSensitivity = 2.5f;
+				config_.PositionSensitivityBoosted = true;
+			}
+
 			if (config_.RotationSensitivity <= 0) config_.RotationSensitivity = 1.0f;
 			if (config_.PositionSmoothing <= 0) config_.PositionSmoothing = 0.35f;
 			if (config_.RotationSmoothing <= 0) config_.RotationSmoothing = 0.45f;

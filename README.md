@@ -9,6 +9,35 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.3.22** - Two fixes from the 0.3.21 diagnostic data and the reported shadow flickering:
+
+- **Translation "does nothing" - resolved, was magnitude not a bug.** A real test log's
+  `endOfRender` diagnostic came back conclusive: `transformPos` and `matrixDecodedPos` matched
+  each other and the `cameraWorldPosAfterWrite` heartbeat exactly, every single frame, across
+  every calibration window. Nothing resets the Transform and nothing reassigns the render matrix
+  behind this mod's back - the offset this mod computes is exactly what reaches the screen. The
+  real issue: at 1x sensitivity, a real seated lean (tens of centimeters) produces the same tiny
+  real-meter shift in-game, which is often too small a parallax to consciously register -
+  especially from chase-cam distance, where the camera already sits several meters from the car;
+  rotation doesn't have this problem since angular sweep on screen doesn't attenuate with
+  distance the way translation parallax does. `PositionSensitivity` is now bumped to 2.5x by
+  default via a one-time migration flag (`PositionSensitivityBoosted`, same pattern as
+  `SensitivityDiagnosticReverted`), so the same real movement should read as a much more obvious
+  shift in cockpit and Photo Mode, and noticeably more in chase cam too. `Camera.onPreCull`/
+  `RenderPipelineManager.beginCameraRendering` apply to every on-screen camera unconditionally
+  (not gated by which mode CarX/Kino currently considers "active"), so this isn't mode-specific -
+  it should be felt in chase, cockpit, replay, and Photo Mode's own camera alike.
+- **Shadow flickering fixed.** Root cause: the 0.3.19 fix for shadows-disappearing-entirely
+  introduced a per-frame `hasZoom || hasPoseOffset` check that switches between
+  `ApplyCameraOverride`'s custom matrices and Unity's automatic ones. Natural hand/phone jitter
+  constantly crosses that check's tiny epsilon threshold around the calibrated neutral point,
+  many times a second - so the code was flipping modes every other frame, and each flip is its
+  own discontinuity the shadow/TAA passes react to, which reads as flicker. Fixed with a simple
+  time-based hysteresis: once a real offset is seen, override mode stays on for a short window
+  (0.3s) afterward instead of re-deciding fresh every frame, so brief threshold jitter can't
+  cause rapid mode-switching - only genuinely holding still at the calibrated neutral point for
+  that long drops back to Unity's automatic matrices.
+
 **0.3.21** - Diagnostic-only, no behavior change. Confirmed (sitting still, moving only the phone,
 not the whole body) that rotation visibly works but translation still shows nothing on screen -
 and every existing diagnostic reads the camera back immediately after this mod's own write, which
