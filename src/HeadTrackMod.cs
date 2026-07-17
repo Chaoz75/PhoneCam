@@ -22,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.3.24", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.3.25", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.3.24";
+		private const string CurrentVersion = "0.3.25";
 
 		private const int DefaultOscPort = 9000;
 
@@ -116,10 +116,13 @@ namespace HeadTrackARKit {
 		private float zoomTargetDegrees_;
 		private float zoomCurrentDegrees_;
 
-		// 0.3.22: fixes reported shadow flicker - see the doc comment at the ApplyCameraOverride/
-		// ResetCameraOverride decision in OnCameraPreCull for the mechanism.
-		private float lastRealOffsetTime_ = float.NegativeInfinity;
-		private const float OverrideHysteresisSeconds = 0.3f;
+		// 0.3.25: free-cam anchor - the camera's full world position/rotation at the moment of
+		// the last F9 calibration. See Calibrate() and OnCameraPreCull's doc comment for why the
+		// camera's pose is now built entirely from this fixed anchor plus the live tracked
+		// offset, instead of adding the offset onto whatever CarX's own camera logic computes
+		// each frame (the old 0.3.8-0.3.24 approach).
+		private Vector3 anchorPosition_;
+		private Quaternion anchorRotation_ = Quaternion.identity;
 
 		// 0.3.23: see CheckOscSignalHealth's doc comment - a real log showed incomingPos AND
 		// incomingEuler both frozen at identical values for 48+ straight seconds, meaning LOTA
@@ -402,14 +405,33 @@ namespace HeadTrackARKit {
 			return $"(x={v.x:F2},y={v.y:F2},z={v.z:F2})";
 		}
 
+		/// <summary>
+		/// 0.3.25: as of the free-cam rework (see OnCameraPreCull's doc comment), calibrating
+		/// does two things instead of one: it still sets the phone's neutral pose (state_.Calibrate,
+		/// unchanged), and it now ALSO locks in <see cref="anchorPosition_"/>/
+		/// <see cref="anchorRotation_"/> - the camera's exact world position/rotation at this
+		/// instant, read from whatever camera GetActiveCamera() currently resolves to. From this
+		/// point on, the camera's entire pose is this fixed anchor plus your live tracked
+		/// movement - not an offset blended onto whatever CarX's own camera logic happens to be
+		/// doing that frame. Re-press F9 any time you want to re-anchor (e.g. after switching
+		/// camera modes, or repositioning in your seat).
+		/// </summary>
 		private void Calibrate() {
 			if (!state_.HasSignal) {
 				Kino.Log.Warning("[HeadTrackARKit] No OSC data received yet - check LOTA is streaming and the port matches.");
 				return;
 			}
 
+			Camera anchorCam = GetActiveCamera();
+			if (anchorCam != null) {
+				anchorPosition_ = anchorCam.transform.position;
+				anchorRotation_ = anchorCam.transform.rotation;
+			}
+
 			state_.Calibrate();
-			Kino.Log.Info("[HeadTrackARKit] Neutral position set.");
+			Kino.Log.Info(
+				$"[HeadTrackARKit] Neutral position set - camera anchor locked at {FormatVector(anchorPosition_)} " +
+				$"on camera '{(anchorCam != null ? anchorCam.name : "none found")}'.");
 		}
 
 		private void OnCameraPreCull(Camera cam) {
@@ -446,93 +468,69 @@ namespace HeadTrackARKit {
 				cam.fieldOfView = Mathf.Clamp(cam.fieldOfView + zoomCurrentDegrees_, 1f, 179f);
 			}
 
-			// 0.3.8: back to writing the head-tracking offset onto the camera's real Transform.
-			// 0.3.7 stopped doing this on the theory that the gauge HUD was moving because it was
-			// parented under the camera's Transform - but a real-game test showed the gauges kept
-			// reacting even without touching the Transform at all, which rules that theory out.
-			// The gauge HUD (MultiHUD, a separate mod) is a "UGUI" Canvas - almost certainly using
-			// Unity's Screen-Space-Camera render mode, which is *designed* to read the camera's
-			// real Transform and fieldOfView directly to stay glued to the screen. Decoupling from
-			// the Transform (0.3.7) made the UI and the 3D world disagree with each other instead
-			// of fixing anything: the UI kept tracking the stale Transform/FOV while the 3D world
-			// rendered from a separately-computed pose, which is what "acting weird" actually was.
-			// Writing to the real Transform/FOV keeps every such system in sync automatically,
-			// exactly like it did before 0.3.7.
-			bool hasPoseOffset = false;
+			// 0.3.25: FREE CAM rework. Every version through 0.3.24 wrote the tracked offset as an
+			// INCREMENT on top of whatever CarX's own camera logic had just computed for this
+			// exact frame (t.position += t.rotation * posOffset) - meaning your tracked movement
+			// was always being blended onto a live, independently-moving target (chase cam sways
+			// with the car, cockpit cam has its own settle/shake behavior, etc.), not a fixed
+			// point. That's a big part of why translation never felt like real tracking: it WAS
+			// being applied correctly (proven repeatedly via lastCameraWorldPosAfterWrite/
+			// endOfRender diagnostics), it was just constantly fighting a moving baseline instead
+			// of sitting on a stable one.
+			//
+			// Now the camera's pose is built ENTIRELY from a fixed anchor (see
+			// anchorPosition_/anchorRotation_, locked in by Calibrate() at F9) plus the live
+			// tracked delta - CarX's own per-frame camera computation for `cam` is completely
+			// ignored, not blended with. This is the same idea as how Photo Mode's own free
+			// camera already works: fully decoupled from gameplay camera logic, driven only by
+			// input (in this case, your phone).
 			if (state_.IsCalibrated) {
 				Vector3 posOffset = state_.GetPositionOffset();
 				Quaternion rotOffset = FixLookDirection(state_.GetRotationOffsetEuler());
 
-				Transform t = cam.transform;
-
 				if (config_.ClippingGuardEnabled && posOffset.sqrMagnitude > 1e-6f) {
-					posOffset = ApplyClippingGuard(t, posOffset);
+					// Raycasts from the anchor, not the camera's current (about-to-be-overwritten)
+					// Transform - the anchor is the real "where would the camera be without your
+					// lean" reference point now.
+					posOffset = ApplyClippingGuard(anchorPosition_, anchorRotation_, posOffset);
 				}
 
 				lastAppliedPosOffset_ = posOffset;
 
-				// 0.3.19: only counts as a real offset worth fighting Kino's camera matrix over
-				// (see the ApplyCameraOverride/ResetCameraOverride choice below) if it's actually
-				// large enough to matter - a sub-millimeter/sub-degree residual left over from
-				// smoothing shouldn't be enough to flip that decision every other frame.
-				hasPoseOffset = posOffset.sqrMagnitude > 1e-6f || Quaternion.Angle(rotOffset, Quaternion.identity) > 0.01f;
-
-				t.position += t.rotation * posOffset;
-				t.rotation = t.rotation * rotOffset;
+				Transform t = cam.transform;
+				t.position = anchorPosition_ + anchorRotation_ * posOffset;
+				t.rotation = anchorRotation_ * rotOffset;
 
 				// 0.3.17: ground-truth check for the "stepping left does nothing" report - logs
-				// the camera's ACTUAL world position right after this mod wrote to it, so the next
-				// test log shows directly whether the Transform write itself is taking effect, as
-				// opposed to something else (e.g. CarX/Kino's own follow-cam logic) overwriting it
-				// again before the frame actually renders. If this value doesn't move when
-				// appliedPosOffset does, the bug is downstream of this mod, not in the offset math.
+				// the camera's ACTUAL world position right after this mod wrote to it, so a test
+				// log shows directly whether the Transform write itself is taking effect. Still
+				// useful post-0.3.25: if this doesn't match anchorPosition_ + the expected offset,
+				// something downstream overwrote the Transform again before the frame rendered.
 				lastCameraWorldPosAfterWrite_ = t.position;
 			}
 
-			// 0.3.19: root-caused the "shadows disappear and motion blur goes crazy the instant
-			// the mod is enabled - even standing still" report. ApplyCameraOverride used to run
-			// unconditionally, every single frame this mod was Enabled, on the theory (see its old
-			// comment, now below) that manually reassigning Camera.worldToCameraMatrix/
-			// projectionMatrix/cullingMatrix was a visual no-op whenever nothing else was
-			// customizing them, since the *values* would come out mathematically identical to
-			// Unity's own defaults. That's true for the values, but not for the side effects of the
-			// assignment itself: setting Camera.projectionMatrix at all switches the camera into
-			// Unity's "custom projection" mode, which turns off the render pipeline's own per-frame
-			// TAA projection jitter and the temporal motion-vector bookkeeping that depends on
-			// comparing this frame's pipeline-managed matrix against last frame's. Reassigning a
-			// clean, non-jittered matrix every single frame forever looks to the motion-vector pass
-			// like the camera never stops moving, even standing dead still - that's the "crazy
-			// motion blur" report exactly. The same override's cullingMatrix feeds cascaded shadow
-			// culling too; a custom culling matrix that doesn't exactly match what the shadow pass
-			// expects can cull shadow-casting geometry out of the shadow map entirely, matching
-			// "shadow disappears."
+			// 0.3.19 root-caused, 0.3.22 patched with hysteresis, 0.3.25 fixes properly: the
+			// custom matrix override (ApplyCameraOverride) only exists to win against Kino's own
+			// Custom Camera system possibly re-freezing the render matrix in Photo Mode - see
+			// ApplyCameraOverride's doc comment. Manually reassigning
+			// worldToCameraMatrix/projectionMatrix disables the render pipeline's per-frame TAA
+			// jitter and temporal motion-vector bookkeeping (the "crazy motion blur while
+			// standing still" report) and can break cascaded shadow culling (the "shadows
+			// disappear/flicker" reports) - so it should only ever run where it's actually needed.
 			//
-			// The whole reason this override exists (see ApplyCameraOverride's doc comment) is to
-			// win against Kino's Custom Camera mode possibly re-freezing the matrix in Photo Mode -
-			// there's nothing to win when this mod isn't currently changing anything about the
-			// camera, so only fight for the matrices on frames where there's a real offset or zoom
-			// to enforce, and hand the camera fully back to Unity's normal automatic derivation
-			// (via ResetCameraOverride) the rest of the time.
-			//
-			// 0.3.22: that raw hasZoom||hasPoseOffset check is exactly what caused the newly
-			// reported shadow *flickering* (distinct from the earlier full shadow-disappearing
-			// bug this same conditional was built to fix). Natural hand/phone jitter constantly
-			// crosses the tiny epsilon threshold inside GetPositionOffset/hasPoseOffset many times
-			// a second around a calibrated center point, so the code was flipping between
-			// ApplyCameraOverride's custom matrices and Unity's automatic ones every other frame -
-			// each flip is itself a discontinuity the shadow/TAA passes can react to, which reads
-			// as flicker rather than the smooth "always on" or "always off" state either mode is
-			// fine at individually. Fixed with a simple time-based hysteresis: once a real offset
-			// is seen, stay in override mode for a short window (OverrideHysteresisSeconds)
-			// afterward instead of re-deciding fresh every single frame, so brief jitter around
-			// the threshold can't cause rapid mode-switching - only a genuine, sustained return to
-			// "nothing to apply" (phone held still at the calibrated neutral point) drops back to
-			// ResetCameraOverride.
-			if (hasZoom || hasPoseOffset) {
-				lastRealOffsetTime_ = Time.unscaledTime;
-			}
-			bool withinHysteresisWindow = Time.unscaledTime - lastRealOffsetTime_ < OverrideHysteresisSeconds;
-			if (withinHysteresisWindow) {
+			// Every version through 0.3.24 decided this per-frame based on offset magnitude
+			// (hasZoom||hasPoseOffset), which meant natural hand jitter crossing the epsilon
+			// threshold flipped the override on and off many times a second outside Photo Mode
+			// too - that flipping was the flicker, not the override itself. The real distinction
+			// was never "is there an offset," it's "are we in Photo Mode" - outside Photo Mode,
+			// plain Transform writes (above) already fully win each frame just by running last
+			// (see the LateUpdate resubscribe comment), proven by the endOfRender diagnostics: no
+			// custom matrix needed there at all, so shadows/TAA/motion blur stay exactly as Unity
+			// intends. Only Kino's Photo Mode camera has ever been suspected of reasserting a
+			// matrix independent of the Transform, so the override is now scoped to Photo Mode
+			// only, unconditionally while calibrated or zoomed - no hysteresis, no per-frame
+			// magnitude judgment call, no flicker.
+			if ((hasZoom || state_.IsCalibrated) && IsInPhotoMode()) {
 				ApplyCameraOverride(cam);
 			} else {
 				ResetCameraOverride(cam);
@@ -611,16 +609,18 @@ namespace HeadTrackARKit {
 		}
 
 		/// <summary>
-		/// Raycasts from the camera's current (pre-offset) position along the direction of the
-		/// desired head-offset, and clamps the offset short of anything it hits. Prevents the
+		/// Raycasts from the free-cam anchor (<paramref name="originPosition"/>/
+		/// <paramref name="originRotation"/> - see anchorPosition_/anchorRotation_, the
+		/// pre-offset reference point as of the 0.3.25 free-cam rework) along the direction of
+		/// the desired head-offset, and clamps the offset short of anything it hits. Prevents the
 		/// tracked camera from poking through the dashboard/seat/window when leaning in.
 		///
 		/// This is off by default (see IHeadTrackConfig.ClippingGuardEnabled) - it needs the
 		/// layer mask tuned against CarX's actual cockpit collision geometry, which isn't
 		/// something that could be verified without the real game running. See README.
 		/// </summary>
-		private Vector3 ApplyClippingGuard(Transform cameraTransform, Vector3 localPosOffset) {
-			Vector3 worldOffset = cameraTransform.rotation * localPosOffset;
+		private Vector3 ApplyClippingGuard(Vector3 originPosition, Quaternion originRotation, Vector3 localPosOffset) {
+			Vector3 worldOffset = originRotation * localPosOffset;
 			float distance = worldOffset.magnitude;
 			if (distance < 1e-5f) return localPosOffset;
 
@@ -628,12 +628,12 @@ namespace HeadTrackARKit {
 			int layerMask = config_.ClippingGuardLayerMask;
 			float castDistance = distance + config_.ClippingGuardMargin;
 
-			if (Physics.Raycast(cameraTransform.position, direction, out RaycastHit hit, castDistance, layerMask, QueryTriggerInteraction.Ignore)) {
+			if (Physics.Raycast(originPosition, direction, out RaycastHit hit, castDistance, layerMask, QueryTriggerInteraction.Ignore)) {
 				float allowedDistance = Mathf.Max(0f, hit.distance - config_.ClippingGuardMargin);
 				if (allowedDistance < distance) {
 					Vector3 clampedWorld = direction * allowedDistance;
-					// Convert the clamped world-space distance back into the camera's local offset space.
-					return Quaternion.Inverse(cameraTransform.rotation) * clampedWorld;
+					// Convert the clamped world-space distance back into the anchor's local offset space.
+					return Quaternion.Inverse(originRotation) * clampedWorld;
 				}
 			}
 
@@ -1296,8 +1296,9 @@ namespace HeadTrackARKit {
 
 			Kino.UI.HorizontalLine();
 			Kino.UI.GroupLabel("Using it");
-			Kino.UI.Label("Sit in your normal position, then press F9 to set neutral - everything after is relative to that pose.");
-			Kino.UI.Label("Re-press F9 any time you shift position.");
+			Kino.UI.Label("Sit in your normal position, then press F9 to lock the camera there as your anchor.");
+			Kino.UI.Label("From that point the camera is a true free cam driven entirely by your phone - it no longer follows the game's own camera.");
+			Kino.UI.Label("Re-press F9 any time you want to re-anchor (after shifting position or switching camera modes).");
 			Kino.UI.Label("Mouse wheel or +/- zooms the camera; F10 resets zoom.");
 			Kino.UI.Label("Leaning/walking moves the camera too - raise 'Max position offset' in Sensitivity/Safety clamps for bigger, room-scale movement.");
 			Kino.UI.Label("Looking/turning fully around (pitch and yaw) has no stopping point - only roll is limited by the safety clamp.");

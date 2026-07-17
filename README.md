@@ -9,6 +9,36 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.3.25** - Free-cam rework, replacing the "add offset onto the game's camera" approach entirely.
+
+Every version through 0.3.24 wrote the tracked offset as an increment on top of whatever CarX's
+own camera logic had just computed for that exact frame (`t.position += t.rotation * posOffset`).
+That meant tracked movement was always blended onto a live, independently-moving target - chase
+cam sways with the car, cockpit cam has its own settle/shake behavior - never a fixed point. That
+was a real part of why translation never felt like genuine tracking, even though repeated
+diagnostics (0.3.17, 0.3.21) proved the write itself was landing correctly every time: it was
+being applied correctly, just against a baseline that kept moving out from under it.
+
+Pressing F9 to calibrate now locks in a full camera anchor (`anchorPosition_`/`anchorRotation_` -
+the active camera's exact world position/rotation at that instant), not just a neutral pose for
+the phone. From then on, the camera's entire pose each frame is anchor + live tracked delta,
+completely independent of whatever CarX's own camera logic wants to do that frame - the same idea
+as how Photo Mode's own free camera already works, fully decoupled from gameplay camera logic and
+driven only by input. This applies in every mode (chase, cockpit, replay, Photo Mode) since it
+still hooks whichever camera Unity is actually about to render, same as before.
+
+This also let the shadow-flicker issue get fixed properly instead of patched again: the custom
+matrix override (`ApplyCameraOverride`) was previously toggled on/off every frame based on offset
+magnitude (0.3.22's hysteresis fix), which was really just managing symptoms of an unnecessary
+fight. The override was only ever needed to beat Kino's own Custom Camera system reasserting
+itself in Photo Mode - outside Photo Mode, a plain Transform write already wins every frame just
+by running last (proven by the 0.3.21 endOfRender diagnostics), so the override is now scoped to
+Photo Mode only. No more hysteresis, no more per-frame magnitude judgment call, no more flicker.
+
+`ApplyClippingGuard` now raycasts from the anchor instead of the camera's current (about to be
+fully overwritten) Transform, since the anchor is the real "where the camera would be without
+your lean" reference point now.
+
 **0.3.24** - Real code fix, not just diagnostics, targeting the repeated dropout pattern from the
 last two test logs: position AND rotation data both going completely silent for extended stretches
 mid-session (48+ seconds one time, 15+ minutes another - sometimes recovering on their own,
