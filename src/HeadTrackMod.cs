@@ -22,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.3.23", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.3.24", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.3.23";
+		private const string CurrentVersion = "0.3.24";
 
 		private const int DefaultOscPort = 9000;
 
@@ -265,8 +265,16 @@ namespace HeadTrackARKit {
 
 			if (gapMs > OscSignalLostThresholdMs && !oscSignalLost_) {
 				oscSignalLost_ = true;
+				// 0.3.24: includes the raw UDP packet count so this one line answers "is the
+				// phone even sending anything right now" on its own - if TotalRawPacketsReceived
+				// keeps climbing on the *next* heartbeat line after this warning despite
+				// LastMessageTick staying stuck, packets are physically arriving but failing to
+				// turn into messages (a parsing bug, fixable here); if it's flat too, nothing is
+				// reaching the socket at all (phone/Wi-Fi/LOTA-side).
 				Kino.Log.Warning(
-					$"[HeadTrackARKit] OSC signal lost - no packets from LOTA for over {gapMs / 1000}s. " +
+					$"[HeadTrackARKit] OSC signal lost - no packets from LOTA for over {gapMs / 1000}s " +
+					$"(totalRawPacketsReceived={receiver_.TotalRawPacketsReceived} as of this warning - " +
+					"compare against the next heartbeat's count to see if that's still climbing). " +
 					"Check LOTA is still streaming (app in foreground, phone screen on) and Wi-Fi is stable.");
 			}
 			else if (gapMs <= OscSignalLostThresholdMs && oscSignalLost_) {
@@ -731,8 +739,16 @@ namespace HeadTrackARKit {
 				// stretch of frozen, identical values (that's how the 48+ second gap that prompted
 				// this got found in the first place).
 				int msSinceLastOscPacket = receiver_.LastMessageTick == 0 ? -1 : Environment.TickCount - receiver_.LastMessageTick;
+				// 0.3.24: totalRawPacketsReceived counts every UDP datagram that hits the socket,
+				// parsed or not - if this keeps climbing while oscMsSinceLastPacket also keeps
+				// climbing (i.e. packets are arriving but LastMessageTick isn't advancing),
+				// packets are reaching the PC but failing to turn into a usable message
+				// (previously: bundle-wrapped packets being silently rejected outright - now
+				// unwrapped, see OscParser.ParseMessages). If both are flat/frozen together,
+				// nothing is reaching the socket at all - phone/Wi-Fi/LOTA-side, not this mod.
 				Kino.Log.Info(
 					$"[HeadTrackARKit][diag] oscMsSinceLastPacket={msSinceLastOscPacket} " +
+					$"totalRawPacketsReceived={receiver_.TotalRawPacketsReceived} " +
 					$"receiverRunning={receiver_.IsRunning} lastSender={receiver_.LastSenderAddress ?? "(none)"}");
 			}
 		}

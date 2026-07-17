@@ -9,6 +9,31 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.3.24** - Real code fix, not just diagnostics, targeting the repeated dropout pattern from the
+last two test logs: position AND rotation data both going completely silent for extended stretches
+mid-session (48+ seconds one time, 15+ minutes another - sometimes recovering on their own,
+sometimes not, and always right around a big/fast movement). The parser was unconditionally
+rejecting any UDP datagram that started with `#` - the marker for an OSC 1.0 *bundle*, a standard
+way for a sender to pack more than one message into a single packet. If LOTA switches to
+bundle-wrapped output under some condition (e.g. batching position+rotation together), every single
+one of those packets was being silently and completely dropped by this mod - which looks exactly
+like "no data at all" on every diagnostic this mod has, without actually being a phone/Wi-Fi/ARKit
+problem.
+
+Added real bundle support: `OscParser.ParseMessages` now recognizes `#bundle` framing, skips the
+8-byte NTP timetag (not meaningful for a live stream - only the newest sample matters), and
+recursively unwraps each (size, element) pair, handling nested bundles too. `OscUdpReceiver` now
+calls this instead of the old single-message `TryParseMessage` directly, so a bundle can yield
+multiple queued messages from one datagram. Both are defensive the same way the original parser
+was - malformed/truncated framing just stops rather than throwing.
+
+Also added `OscUdpReceiver.TotalRawPacketsReceived` - a count of every UDP datagram that hits the
+socket at all, parsed or not, independent of `LastMessageTick`. This is folded into both the
+periodic heartbeat and the `CheckOscSignalHealth` warning from 0.3.23, so if another dropout
+happens, the log itself will show whether packets are still physically arriving (a remaining
+parsing gap, fixable here) or genuinely nothing is reaching the socket (phone/Wi-Fi/LOTA-side) -
+no more guessing between the two.
+
 **0.3.23** - Diagnostic-only, no behavior change to tracking itself. A real test log with 2.5x
 sensitivity (0.3.22) showed the offset math genuinely working - `appliedPosOffset` swung as far as
 ±0.30m as the phone moved, correctly tracking `incomingPos`. But 48+ seconds into that same log,

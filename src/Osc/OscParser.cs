@@ -38,8 +38,83 @@ namespace HeadTrackARKit.Osc {
 	/// No dependency on Unity types so this class can be compiled and unit tested standalone.
 	/// </summary>
 	public static class OscParser {
+		private static readonly byte[] BundleTag = Encoding.ASCII.GetBytes("#bundle\0");
+
 		/// <summary>
-		/// Attempt to parse a single OSC message from a raw UDP datagram.
+		/// Parses a raw UDP datagram into zero or more OSC messages, appending them to
+		/// <paramref name="results"/>. This is the entry point <see cref="OscUdpReceiver"/> uses
+		/// (instead of calling <see cref="TryParseMessage"/> directly), since a single UDP
+		/// datagram can legally contain more than one message if the sender wraps them in an
+		/// OSC 1.0 bundle.
+		///
+		/// 0.3.24: added because of a real, repeated dropout pattern - position AND rotation data
+		/// both going completely silent for extended stretches mid-session (sometimes recovering
+		/// on their own later, sometimes not) - which is consistent with LOTA switching to
+		/// bundle-wrapped output under some condition (e.g. batching position+rotation into one
+		/// packet together). Every earlier version of this parser explicitly rejected anything
+		/// starting with "#" (the bundle marker - see the check still in
+		/// <see cref="TryParseMessage"/>, kept there as a defensive leaf-level guard) rather than
+		/// unwrapping it, so if that theory's right, every packet during those stretches was
+		/// being silently and completely dropped - which looks exactly like "no data at all" on
+		/// every diagnostic this mod has, without actually being a phone/Wi-Fi/ARKit-tracking
+		/// problem.
+		///
+		/// Handles nested bundles (a bundle element can itself be another bundle, per the OSC 1.0
+		/// spec) via recursion, and is defensive the same way TryParseMessage is: malformed or
+		/// truncated bundle framing just stops parsing further elements rather than throwing,
+		/// keeping whatever valid messages were already found up to that point.
+		/// </summary>
+		public static void ParseMessages(byte[] buffer, int length, List<OscMessage> results) {
+			try {
+				ParseMessagesInternal(buffer, length, results);
+			}
+			catch {
+				// Defensive, same reasoning as TryParseMessage's own catch-all - never let a
+				// corrupt/truncated datagram throw out of the parser. Whatever was already added
+				// to `results` before the failure point is kept rather than discarded.
+			}
+		}
+
+		private static void ParseMessagesInternal(byte[] buffer, int length, List<OscMessage> results) {
+			if (buffer == null || length <= 0) return;
+
+			if (length >= 16 && IsBundleTag(buffer)) {
+				// "#bundle\0" (8 bytes) + an 8-byte NTP timetag (ignored - for a live head-
+				// tracking stream only the newest sample matters, delivery-order scheduling
+				// isn't meaningful here) + zero or more (int32 size, element) pairs, each
+				// element itself either a plain message or another nested bundle.
+				// 8 bytes for "#bundle\0" + 8 bytes for the timetag = 16 bytes consumed before
+				// the first (size, element) pair.
+				int offset = 16;
+
+				while (offset + 4 <= length) {
+					if (!ReadInt32(buffer, length, ref offset, out int elementSize)) return;
+					if (elementSize < 0 || offset + elementSize > length) return;
+
+					byte[] element = new byte[elementSize];
+					Array.Copy(buffer, offset, element, 0, elementSize);
+					ParseMessagesInternal(element, elementSize, results);
+
+					offset += elementSize;
+				}
+				return;
+			}
+
+			if (TryParseMessage(buffer, length, out OscMessage msg)) {
+				results.Add(msg);
+			}
+		}
+
+		private static bool IsBundleTag(byte[] buffer) {
+			for (int i = 0; i < BundleTag.Length; i++) {
+				if (buffer[i] != BundleTag[i]) return false;
+			}
+			return true;
+		}
+
+		/// <summary>
+		/// Attempt to parse a single OSC message from a raw UDP datagram (or a single unwrapped
+		/// bundle element - see <see cref="ParseMessages"/>).
 		/// Returns false (without throwing) on any malformed input - packets from the network
 		/// should never be trusted enough to let a parse exception bubble up into game code.
 		/// </summary>

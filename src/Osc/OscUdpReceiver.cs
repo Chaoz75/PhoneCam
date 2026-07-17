@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
@@ -22,6 +23,18 @@ namespace HeadTrackARKit.Osc {
 
 		/// <summary>Timestamp (Environment.TickCount) of the last successfully parsed packet, or 0 if none yet.</summary>
 		public volatile int LastMessageTick;
+
+		// 0.3.24: tracks every UDP datagram that actually hits the socket, regardless of whether
+		// it went on to parse into a usable message (wrong sender, malformed, or - previously -
+		// bundle-wrapped and silently rejected outright). Compared against LastMessageTick, this
+		// is what lets a future log tell "packets are arriving but not turning into messages"
+		// (a real, fixable bug in this mod's own parsing) apart from "nothing is arriving at the
+		// socket at all" (phone/Wi-Fi/LOTA-side, outside this mod's control) - previously there
+		// was no way to distinguish the two from the log alone.
+		private long totalRawPacketsReceived_;
+
+		/// <summary>Count of every UDP datagram received on this socket so far, parsed or not.</summary>
+		public long TotalRawPacketsReceived => Interlocked.Read(ref totalRawPacketsReceived_);
 
 		// Reference assignment is atomic in .NET and `volatile` gives the visibility guarantee
 		// needed for the background receive thread to hand this off to the main thread without
@@ -78,6 +91,10 @@ namespace HeadTrackARKit.Osc {
 
 		private void ReceiveLoop() {
 			var remote = new IPEndPoint(IPAddress.Any, 0);
+			// Reused across iterations rather than allocated fresh each datagram - cleared at
+			// the top of every loop instead. A live head-tracking stream calls this many times
+			// a second, so avoiding a per-packet allocation here is cheap insurance.
+			var messages = new List<OscMessage>(4);
 
 			while (running_) {
 				byte[] data;
@@ -96,6 +113,10 @@ namespace HeadTrackARKit.Osc {
 					continue;
 				}
 
+				// Counts every datagram that reaches the socket, before the sender filter or
+				// parsing gets a say - see the field comment on TotalRawPacketsReceived.
+				Interlocked.Increment(ref totalRawPacketsReceived_);
+
 				string filter = AllowedSenderFilter;
 				if (!string.IsNullOrEmpty(filter) &&
 				    !string.Equals(remote.Address.ToString(), filter, StringComparison.OrdinalIgnoreCase)) {
@@ -104,10 +125,18 @@ namespace HeadTrackARKit.Osc {
 					continue;
 				}
 
-				if (OscParser.TryParseMessage(data, data.Length, out OscMessage msg)) {
+				// 0.3.24: was TryParseMessage(data, data.Length, out OscMessage msg) - a single
+				// UDP datagram can legally contain more than one OSC message if the sender wraps
+				// them in a bundle, which TryParseMessage alone can't unwrap (see ParseMessages's
+				// doc comment for why this matters here specifically).
+				messages.Clear();
+				OscParser.ParseMessages(data, data.Length, messages);
+				if (messages.Count > 0) {
 					LastMessageTick = Environment.TickCount;
 					lastSenderAddress_ = remote.Address.ToString();
-					queue_.Enqueue(msg);
+					foreach (OscMessage msg in messages) {
+						queue_.Enqueue(msg);
+					}
 				}
 			}
 		}
