@@ -22,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.3.20", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.3.21", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.3.20";
+		private const string CurrentVersion = "0.3.21";
 
 		private const int DefaultOscPort = 9000;
 
@@ -182,12 +182,21 @@ namespace HeadTrackARKit {
 			Camera.onPreCull += OnCameraPreCull;
 			RenderPipelineManager.beginCameraRendering += OnBeginCameraRendering;
 
+			// 0.3.21: diagnostic-only addition (see OnEndCameraRendering's doc comment) - fires as
+			// late as it's possible to observe a camera's state, after it has already finished
+			// rendering for the frame. Not subscribed via the every-LateUpdate resubscribe trick
+			// like the two above, since it's a pure read - it doesn't matter where in the
+			// subscriber list a read-only handler sits, it'll see whatever the true end-of-render
+			// state is regardless.
+			RenderPipelineManager.endCameraRendering += OnEndCameraRendering;
+
 			Kino.Log.Info($"[HeadTrackARKit] Loaded. Enabled={config_.Enabled}. Bind key default: F9 to calibrate neutral position.");
 		}
 
 		private void OnDestroy() {
 			Camera.onPreCull -= OnCameraPreCull;
 			RenderPipelineManager.beginCameraRendering -= OnBeginCameraRendering;
+			RenderPipelineManager.endCameraRendering -= OnEndCameraRendering;
 			receiver_.Stop();
 		}
 
@@ -482,6 +491,41 @@ namespace HeadTrackARKit {
 		/// </summary>
 		private void OnBeginCameraRendering(ScriptableRenderContext context, Camera cam) {
 			OnCameraPreCull(cam);
+		}
+
+		/// <summary>
+		/// 0.3.21 diagnostic, added specifically to chase the "rotation visibly works, translation
+		/// never does - even sitting still, moving only the phone" report. Every previous
+		/// diagnostic (cameraWorldPosAfterWrite in OnCameraPreCull) reads the camera back
+		/// immediately after THIS mod's own write, which can only prove the write happened - it
+		/// can't see anything that might happen to the camera *afterward*, later in the same
+		/// frame's render. This fires after Unity has already finished rendering this camera - as
+		/// late as its state can be observed - and logs two independent readings:
+		///
+		/// 1. <c>cam.transform.position</c> - the plain Transform value. If this differs from what
+		///    the heartbeat's cameraWorldPosAfterWrite showed earlier the same frame, something
+		///    reset the Transform itself between our write and the actual render.
+		/// 2. The position decoded directly out of the camera's *current*
+		///    <c>worldToCameraMatrix</c> (by inverting it and transforming the origin through it) -
+		///    this reflects whatever matrix the render pipeline actually used to produce this
+		///    camera's pixels, independent of the Transform. If this disagrees with #1, something
+		///    reassigned worldToCameraMatrix specifically (e.g. a stabilization/anti-shake render
+		///    feature, or Kino's own camera system reasserting itself) without ever touching the
+		///    Transform - which would make every earlier diagnostic look correct while the screen
+		///    still never moves, exactly matching the report.
+		///
+		/// Comparing all three numbers (this frame's cameraWorldPosAfterWrite, and these two) is
+		/// the whole point - whichever pair first disagrees pinpoints where between "this mod wrote
+		/// an offset" and "pixels hit the screen" the movement is actually getting lost.
+		/// </summary>
+		private void OnEndCameraRendering(ScriptableRenderContext context, Camera cam) {
+			if (!config_.Enabled || cam == null || cam.targetTexture != null || cam.orthographic) return;
+
+			Vector3 transformPos = cam.transform.position;
+			Vector3 matrixDecodedPos = cam.worldToCameraMatrix.inverse.MultiplyPoint3x4(Vector3.zero);
+
+			Kino.Log.Info(
+				$"[HeadTrackARKit][diag] endOfRender cam='{cam.name}' transformPos={FormatVector(transformPos)} matrixDecodedPos={FormatVector(matrixDecodedPos)}");
 		}
 
 		/// <summary>

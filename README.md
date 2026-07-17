@@ -9,6 +9,22 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.3.21** - Diagnostic-only, no behavior change. Confirmed (sitting still, moving only the phone,
+not the whole body) that rotation visibly works but translation still shows nothing on screen -
+and every existing diagnostic reads the camera back immediately after this mod's own write, which
+can only prove the write happened, not that nothing touches the camera afterward, later the same
+frame. Added an `RenderPipelineManager.endCameraRendering` hook (fires after Unity has already
+finished rendering that camera, as late as its state can be observed) that logs two more numbers
+per frame: `cam.transform.position` at that point, and the position decoded directly out of the
+camera's *current* `worldToCameraMatrix` (independent of the Transform). Comparing these against
+the same frame's `cameraWorldPosAfterWrite` heartbeat line will show exactly where between "this
+mod wrote an offset" and "pixels hit the screen" the movement is getting lost - if the Transform
+reading disagrees with our own write, something resets the Transform after us; if the matrix-decoded
+reading disagrees with the Transform, something reassigns the render matrix directly (e.g. a
+camera stabilization/anti-shake system, common in racing sims for cockpit views, or Kino's own
+camera system) without ever touching the Transform at all - which would explain every previous
+diagnostic looking correct while the screen still never moves.
+
 **0.3.20** - The 0.3.19 sensitivity revert didn't actually take effect: a fresh output.log from
 a real session still showed `positionSensitivity=11.48` loading under 0.3.19. Cause: config saving
 has genuinely worked since 0.3.17, so the inflated value from playing with the 0.3.18 diagnostic
