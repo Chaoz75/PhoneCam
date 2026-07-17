@@ -22,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.3.22", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.3.23", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.3.22";
+		private const string CurrentVersion = "0.3.23";
 
 		private const int DefaultOscPort = 9000;
 
@@ -121,6 +121,15 @@ namespace HeadTrackARKit {
 		private float lastRealOffsetTime_ = float.NegativeInfinity;
 		private const float OverrideHysteresisSeconds = 0.3f;
 
+		// 0.3.23: see CheckOscSignalHealth's doc comment - a real log showed incomingPos AND
+		// incomingEuler both frozen at identical values for 48+ straight seconds, meaning LOTA
+		// simply stopped sending packets for that whole stretch. Nothing in the mod logged that
+		// as an event, so it only showed up after manually diffing consecutive heartbeat lines by
+		// hand. This tracks whether we're currently considered "in an outage" so the transition
+		// (both directions) gets logged clearly instead of requiring that manual diff again.
+		private bool oscSignalLost_;
+		private const int OscSignalLostThresholdMs = 2000;
+
 		// --- In-game updater ---
 		// Checks GitHub Releases directly (not KSL's own updater, which only runs at game
 		// startup) so a newer build can be fetched into kino/mods without closing the game.
@@ -207,6 +216,7 @@ namespace HeadTrackARKit {
 
 		private void Update() {
 			receiver_.DrainInto(HandleOscMessage);
+			CheckOscSignalHealth();
 
 			// Legacy Input Manager scroll axis - not part of Kino.Input's rebindable hotkey
 			// system since it's a continuous axis rather than a discrete key, so it's polled
@@ -223,6 +233,46 @@ namespace HeadTrackARKit {
 			float smoothing = Mathf.Clamp01(config_.ZoomSmoothing);
 			float rate = 1f - Mathf.Pow(1f - smoothing, Time.unscaledDeltaTime * 60f);
 			zoomCurrentDegrees_ = Mathf.Lerp(zoomCurrentDegrees_, zoomTargetDegrees_, rate);
+		}
+
+		/// <summary>
+		/// 0.3.23: added specifically because a real test log showed 48+ seconds where
+		/// incomingPos and incomingEuler both sat frozen at identical values - the mod's own
+		/// offset math was fine (confirmed by earlier, real movement in the same log), there was
+		/// just no live data coming in to track for that whole stretch, most likely because LOTA
+		/// stopped streaming (phone screen locked, app backgrounded, Wi-Fi dropped). Nothing in
+		/// the mod surfaced that as an event before this - the settings panel's "Status: no data"
+		/// line would have shown it live if it happened to be open, but the log itself gave no
+		/// indication short of manually diffing consecutive heartbeat lines by hand.
+		///
+		/// Logs a clear one-time warning the moment the gap since the last successfully parsed
+		/// OSC packet crosses <see cref="OscSignalLostThresholdMs"/> (2s - deliberately looser
+		/// than the settings panel's stricter 750ms "receiving data" indicator, so a normal brief
+		/// UDP hiccup doesn't spam the log), and a matching one-time recovery log when packets
+		/// resume. <see cref="oscSignalLost_"/> makes both edges fire exactly once per outage
+		/// instead of every frame. The ongoing gap is also folded into the periodic heartbeat (see
+		/// LogCameraDiagnostics) so a future log shows this continuously, not just at the edges.
+		/// </summary>
+		private void CheckOscSignalHealth() {
+			if (!config_.Enabled || !receiver_.IsRunning) return;
+
+			// LastMessageTick is still 0 before the very first packet ever arrives - that's "never
+			// connected yet," not "signal lost," so it's excluded here rather than immediately
+			// warning the moment the mod starts.
+			if (receiver_.LastMessageTick == 0) return;
+
+			int gapMs = Environment.TickCount - receiver_.LastMessageTick;
+
+			if (gapMs > OscSignalLostThresholdMs && !oscSignalLost_) {
+				oscSignalLost_ = true;
+				Kino.Log.Warning(
+					$"[HeadTrackARKit] OSC signal lost - no packets from LOTA for over {gapMs / 1000}s. " +
+					"Check LOTA is still streaming (app in foreground, phone screen on) and Wi-Fi is stable.");
+			}
+			else if (gapMs <= OscSignalLostThresholdMs && oscSignalLost_) {
+				oscSignalLost_ = false;
+				Kino.Log.Info("[HeadTrackARKit] OSC signal restored.");
+			}
 		}
 
 		private void LateUpdate() {
@@ -674,6 +724,16 @@ namespace HeadTrackARKit {
 				// camera stacking). Compare consecutive lines of this specifically, not just once.
 				Kino.Log.Info(
 					$"[HeadTrackARKit][diag] cameraWorldPosAfterWrite={FormatVector(lastCameraWorldPosAfterWrite_)}");
+				// 0.3.23: continuous companion to CheckOscSignalHealth's edge-triggered warning -
+				// this prints every heartbeat regardless of whether an outage is currently
+				// happening, so a future log shows the OSC connection's health directly instead of
+				// needing incomingPos/incomingEuler manually diffed line-by-line to notice a long
+				// stretch of frozen, identical values (that's how the 48+ second gap that prompted
+				// this got found in the first place).
+				int msSinceLastOscPacket = receiver_.LastMessageTick == 0 ? -1 : Environment.TickCount - receiver_.LastMessageTick;
+				Kino.Log.Info(
+					$"[HeadTrackARKit][diag] oscMsSinceLastPacket={msSinceLastOscPacket} " +
+					$"receiverRunning={receiver_.IsRunning} lastSender={receiver_.LastSenderAddress ?? "(none)"}");
 			}
 		}
 

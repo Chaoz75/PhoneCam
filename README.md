@@ -9,6 +9,23 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.3.23** - Diagnostic-only, no behavior change to tracking itself. A real test log with 2.5x
+sensitivity (0.3.22) showed the offset math genuinely working - `appliedPosOffset` swung as far as
+±0.30m as the phone moved, correctly tracking `incomingPos`. But 48+ seconds into that same log,
+`incomingPos` *and* `incomingEuler` both froze at identical values simultaneously, for over 48
+straight seconds, all the way to the end of the captured log. That only happens if LOTA stopped
+sending OSC packets entirely for that whole stretch (phone screen locked, app backgrounded, Wi-Fi
+dropped, etc.) - nothing was wrong with the mod's own math, there was just no live data left to
+track. Nothing surfaced this as an event before now; it only showed up after manually diffing
+consecutive heartbeat log lines by hand.
+
+Added `CheckOscSignalHealth()` (called from `Update()`), which logs a one-time warning the moment
+the gap since the last successfully parsed OSC packet crosses 2 seconds ("OSC signal lost..."),
+and a matching one-time "OSC signal restored" once packets resume - so an outage like this is
+immediately visible in the log instead of requiring a manual diff. Also folded a continuous
+`oscMsSinceLastPacket`/`receiverRunning`/`lastSender` line into the existing ~2-second heartbeat,
+so future logs show OSC connection health at every heartbeat, not just at the edges of an outage.
+
 **0.3.22** - Two fixes from the 0.3.21 diagnostic data and the reported shadow flickering:
 
 - **Translation "does nothing" - resolved, was magnitude not a bug.** A real test log's
