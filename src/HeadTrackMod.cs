@@ -22,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.3.19", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.3.20", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.3.19";
+		private const string CurrentVersion = "0.3.20";
 
 		private const int DefaultOscPort = 9000;
 
@@ -845,6 +845,19 @@ namespace HeadTrackARKit {
 			// done, same as every other numeric default here: only fills in a truly unset (0) value,
 			// doesn't fight a value you've already tuned.
 			if (config_.PositionSensitivity <= 0) config_.PositionSensitivity = 1.0f;
+
+			// 0.3.20: the 0.3.19 revert above didn't actually take effect for anyone who'd already
+			// played with the 0.3.18 diagnostic build - a fresh output.log showed
+			// positionSensitivity=11.48 still loading under 0.3.19, because that's a real saved
+			// value (not the unset/zero case the check above catches), and config saving has
+			// actually worked since 0.3.17. Force it back to 1x exactly once via a dedicated
+			// migration flag (see SensitivityDiagnosticReverted) so the stale diagnostic-era value
+			// gets caught regardless of what it currently is, without permanently overriding
+			// whatever you tune it to afterward.
+			if (!config_.SensitivityDiagnosticReverted) {
+				config_.PositionSensitivity = 1.0f;
+				config_.SensitivityDiagnosticReverted = true;
+			}
 			if (config_.RotationSensitivity <= 0) config_.RotationSensitivity = 1.0f;
 			if (config_.PositionSmoothing <= 0) config_.PositionSmoothing = 0.35f;
 			if (config_.RotationSmoothing <= 0) config_.RotationSmoothing = 0.45f;

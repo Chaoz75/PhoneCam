@@ -35,6 +35,18 @@ namespace HeadTrackARKit {
 		bool PositionRangeUpgraded { get; set; }
 
 		/// <summary>
+		/// One-time migration flag, same pattern as <see cref="PositionRangeUpgraded"/>. 0.3.18
+		/// temporarily forced PositionSensitivity to 8x (up to 15x via the slider) for diagnostic
+		/// purposes, and - once config saving started actually working (0.3.17) - that inflated
+		/// value gets saved and persists forever, since the plain "PositionSensitivity &lt;= 0"
+		/// unset-check never catches a value that was legitimately set once, just very high. The
+		/// very first time this loads on 0.3.20+, PositionSensitivity gets force-reset to a normal
+		/// 1x regardless of whatever inflated value is currently saved. After that one correction
+		/// this is never touched again, so tuning the slider afterward always sticks.
+		/// </summary>
+		bool SensitivityDiagnosticReverted { get; set; }
+
+		/// <summary>
 		/// Max roll offset, in degrees, applied after sensitivity scaling. As of 0.3.11 this only
 		/// clamps roll (tilting your head sideways) - pitch (up/down) and yaw (left/right) are left
 		/// unclamped so a full real-world 360-degree turn keeps rotating the camera continuously

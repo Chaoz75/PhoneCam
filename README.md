@@ -9,6 +9,27 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.3.20** - The 0.3.19 sensitivity revert didn't actually take effect: a fresh output.log from
+a real session still showed `positionSensitivity=11.48` loading under 0.3.19. Cause: config saving
+has genuinely worked since 0.3.17, so the inflated value from playing with the 0.3.18 diagnostic
+build (forced 8x, tunable up to 15x) got saved for real - and the revert's `PositionSensitivity <= 0`
+check only ever catches a truly-unset value, not "was legitimately set once to something extreme."
+Added a dedicated one-time migration flag (`SensitivityDiagnosticReverted`, same pattern as the
+existing `PositionRangeUpgraded`) that force-resets `PositionSensitivity` to 1x exactly once on
+first 0.3.20 load, regardless of whatever value is currently saved - after that one correction,
+tuning the slider sticks normally, same as everything else.
+
+This should also directly fix the still-reported "parts of the car (trunk, rear glass) disappear
+when leaning toward them" and "camera doesn't move where I move in real life" - both are consistent
+with translation still landing many times too large at sensitivity 11.48, either flying the camera
+far enough to trigger CarX's own proximity-based part-hide system, or making a small real lean look
+like the camera teleporting rather than tracking smoothly.
+
+Separately: this session's log showed `photoMode=False` for all ~190 diagnostic lines, meaning
+either Photo Mode wasn't actually entered this test, or `IsInPhotoMode()`'s detection
+(`UIPhotoModeContext.isActive`) isn't picking it up - worth confirming which on the next test
+specifically while inside native Photo Mode, since translation is meant to work identically there.
+
 **0.3.19** - Fixed a real regression: shadows disappearing and severe motion blur (even while
 completely stationary) the moment the mod was enabled, reported from an online session.
 Root cause: `ApplyCameraOverride` - which manually reassigns
