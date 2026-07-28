@@ -35,6 +35,21 @@ through whichever of these is true:
 The 750ms "receiving data" threshold is now factored into a single shared `IsReceivingData()`
 helper used by both this and the settings panel, so the two can't ever disagree with each other.
 
+Also closes a real gap in the endOfRender diagnostic (0.3.21): it has only ever checked whether the
+camera's *position* survives to the actual render, by decoding position directly out of the matrix
+Unity used and comparing it to the plain Transform value - and every single time that's been
+checked, across dozens of logs, it's matched. It has never once checked *rotation* the same way,
+despite "I can look left/right/up/down and nothing happens" being the single most consistently
+repeated complaint this whole project - separate from the (also repeatedly proven, separately) OSC
+dropout pattern. Position riding through untouched while something else re-asserts the camera's
+orientation specifically - e.g. a chase-cam look-at correction that itself runs at the
+onPreCull/beginCameraRendering stage, after this mod's own resubscribe-to-the-end trick - would look
+exactly like "nothing is wrong" in every diagnostic this mod has ever had. `endOfRender` now also
+decodes the camera's actual forward direction straight out of `worldToCameraMatrix` and logs it
+alongside `transform.forward`, so a future log during an actual "I turned my head and nothing
+happened" moment can show directly whether rotation is being silently overwritten after this mod
+writes it, the same way position was already provably ruled out.
+
 **0.3.28** - Hardens the OSC receiver against short stalls, and separately flags a real "wrong
 moment to calibrate" finding from the latest test log.
 

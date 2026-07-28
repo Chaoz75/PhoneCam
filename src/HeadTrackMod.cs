@@ -649,8 +649,24 @@ namespace HeadTrackARKit {
 			Vector3 transformPos = cam.transform.position;
 			Vector3 matrixDecodedPos = cam.worldToCameraMatrix.inverse.MultiplyPoint3x4(Vector3.zero);
 
+			// 0.3.29: this diagnostic has proven position survives to the final render, every time
+			// it's been checked, across dozens of logs - but it has never once checked ROTATION the
+			// same way, and "I can move the camera left/right/up/down and nothing happens" has been
+			// the single most consistently repeated complaint this whole project, distinct from the
+			// (separately, repeatedly proven) OSC dropout pattern. It's entirely possible for
+			// position to ride through untouched while something else - e.g. a chase-cam look-at
+			// correction that itself runs at the onPreCull/beginCameraRendering stage, after this
+			// mod's own resubscribe-to-the-end trick - reasserts the camera's ORIENTATION only,
+			// leaving position alone. Nothing in this mod has ever been able to tell those two cases
+			// apart until now. Same technique as the position check: decode the camera's actual
+			// forward direction directly out of the matrix that was really used to render this
+			// frame, independent of the Transform, and compare against transform.forward.
+			Vector3 transformForward = cam.transform.forward;
+			Vector3 matrixDecodedForward = cam.worldToCameraMatrix.inverse.MultiplyVector(new Vector3(0f, 0f, -1f)).normalized;
+
 			Kino.Log.Info(
-				$"[HeadTrackARKit][diag] endOfRender cam='{cam.name}' transformPos={FormatVector(transformPos)} matrixDecodedPos={FormatVector(matrixDecodedPos)}");
+				$"[HeadTrackARKit][diag] endOfRender cam='{cam.name}' transformPos={FormatVector(transformPos)} matrixDecodedPos={FormatVector(matrixDecodedPos)} " +
+				$"transformFwd={FormatVector(transformForward)} matrixDecodedFwd={FormatVector(matrixDecodedForward)}");
 		}
 
 		/// <summary>
