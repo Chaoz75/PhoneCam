@@ -9,6 +9,17 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.3.30** - Adds `maxRotationOffset`/`rotationSensitivity` to the periodic heartbeat log, next to
+the equivalent position fields that have been there since 0.3.14. A fresh 0.3.29 test log showed
+`appliedOffsetEuler` swinging by 50-120 degrees between consecutive ~2-second heartbeats while the
+camera's actual rendered facing direction (confirmed via 0.3.29's new endOfRender rotation check)
+matched exactly every single time - so rotation genuinely is reaching the screen, but swings that
+large this quickly go well beyond normal head movement. `RotationSensitivity` has never had the
+same safety net `PositionSensitivity` needed twice (see `SensitivityDiagnosticReverted`,
+`PositionSensitivityBoosted`) for a stale/inflated saved value, and there was no way to check it
+from a log at all until now. No code behavior changes - purely a visibility gap closed so the next
+log settles whether this is a sensitivity-tuning issue or something else.
+
 **0.3.29** - Adds an always-on-screen status readout, separate from the settings panel, so a
 "camera isn't moving" moment is diagnosable at a glance during actual gameplay instead of needing a
 log pulled afterward.
