@@ -9,6 +9,32 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.3.29** - Adds an always-on-screen status readout, separate from the settings panel, so a
+"camera isn't moving" moment is diagnosable at a glance during actual gameplay instead of needing a
+log pulled afterward.
+
+Every single dropout investigated across this whole project - roughly a dozen separate test
+sessions now, most recently one where `totalRawPacketsReceived` sat frozen for 257 consecutive
+heartbeats (447+ seconds) while the reporter's phone had, as it turned out, locked its screen -
+has traced back to the same thing: LOTA stops transmitting, and nothing reaches this PC's socket
+at all. The settings panel's "Status: receiving data / no data" line already reflects this
+correctly, but it's only visible while that specific menu happens to be open, which it normally
+isn't mid-drive - so the exact moment someone would notice "the camera stopped responding" has
+never had anything on screen to check against, and the two possible causes (LOTA-side vs. this
+mod) look identical from the driver's seat without it.
+
+`OnGUI()` now draws a small always-visible corner label whenever the mod is Enabled, cycling
+through whichever of these is true:
+
+- `PhoneCam: OSC listener not running` (red) - the receiver itself isn't up.
+- `PhoneCam: waiting for LOTA - no packets received yet` (yellow) - never connected this session.
+- `PhoneCam: NO SIGNAL (Xs)` (red) - was connected, now isn't; shows the exact gap in seconds.
+- `PhoneCam: receiving data - press F9 to calibrate` (yellow) - connected but never calibrated.
+- `PhoneCam: tracking` (green) - connected and calibrated.
+
+The 750ms "receiving data" threshold is now factored into a single shared `IsReceivingData()`
+helper used by both this and the settings panel, so the two can't ever disagree with each other.
+
 **0.3.28** - Hardens the OSC receiver against short stalls, and separately flags a real "wrong
 moment to calibrate" finding from the latest test log.
 

@@ -22,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.3.28", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.3.29", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.3.28";
+		private const string CurrentVersion = "0.3.29";
 
 		private const int DefaultOscPort = 9000;
 
@@ -125,6 +125,17 @@ namespace HeadTrackARKit {
 		// (both directions) gets logged clearly instead of requiring that manual diff again.
 		private bool oscSignalLost_;
 		private const int OscSignalLostThresholdMs = 2000;
+
+		// 0.3.29: every recurring "camera isn't moving" report so far has traced back to the exact
+		// same thing - LOTA stopped sending (phone screen locked/backgrounded, app closed, Wi-Fi
+		// dropped) - confirmed each time by totalRawPacketsReceived going flat. The settings panel
+		// already surfaces this via its "Status:" line, but that's only visible while the panel is
+		// open, which it normally isn't during actual gameplay - so the natural moment to notice a
+		// dropout (mid-drive, camera not responding) has never had anything on screen to check
+		// against. This draws the same connected/calibrated state as a small always-on corner label
+		// whenever the mod is Enabled, regardless of whether any menu is open, so "is this LOTA or
+		// is this the mod" is answerable at a glance instead of needing a log pulled afterward.
+		private GUIStyle hudStyle_;
 
 		// --- In-game updater ---
 		// Checks GitHub Releases directly (not KSL's own updater, which only runs at game
@@ -294,6 +305,58 @@ namespace HeadTrackARKit {
 			Camera.onPreCull += OnCameraPreCull;
 			RenderPipelineManager.beginCameraRendering -= OnBeginCameraRendering;
 			RenderPipelineManager.beginCameraRendering += OnBeginCameraRendering;
+		}
+
+		/// <summary>
+		/// 0.3.29: see the field comment on <see cref="hudStyle_"/>. IMGUI's OnGUI runs independent
+		/// of the Built-in/SRP render path split that made Camera.onPreCull vs
+		/// RenderPipelineManager.beginCameraRendering necessary elsewhere in this file, so a single
+		/// implementation covers both. Deliberately terse (one line, top-left) - this is a glance-
+		/// able status indicator, not a replacement for the settings panel's fuller detail.
+		/// </summary>
+		private void OnGUI() {
+			if (!config_.Enabled) return;
+
+			string text;
+			Color color;
+
+			if (!receiver_.IsRunning) {
+				text = "PhoneCam: OSC listener not running (toggle Enabled off/on to retry)";
+				color = Color.red;
+			}
+			else if (receiver_.LastMessageTick == 0) {
+				text = "PhoneCam: waiting for LOTA - no packets received yet";
+				color = Color.yellow;
+			}
+			else if (!IsReceivingData()) {
+				float secondsSinceLastPacket = (Environment.TickCount - receiver_.LastMessageTick) / 1000f;
+				text = $"PhoneCam: NO SIGNAL ({secondsSinceLastPacket:F0}s) - check LOTA (screen on, app in foreground), then press F9";
+				color = Color.red;
+			}
+			else if (!state_.IsCalibrated) {
+				text = "PhoneCam: receiving data - press F9 to calibrate";
+				color = Color.yellow;
+			}
+			else {
+				text = "PhoneCam: tracking";
+				color = Color.green;
+			}
+
+			if (hudStyle_ == null) {
+				hudStyle_ = new GUIStyle(GUI.skin.label) {
+					fontSize = 16,
+					fontStyle = FontStyle.Bold
+				};
+			}
+
+			// A black backdrop copy drawn one pixel offset behind the colored text so it stays
+			// readable against bright/white backgrounds (sky, headlights, snow) instead of just
+			// the colored text alone.
+			hudStyle_.normal.textColor = Color.black;
+			GUI.Label(new Rect(21, 21, 700, 30), text, hudStyle_);
+
+			hudStyle_.normal.textColor = color;
+			GUI.Label(new Rect(20, 20, 700, 30), text, hudStyle_);
 		}
 
 		private void AdjustZoom(float deltaDegrees) {
@@ -735,6 +798,18 @@ namespace HeadTrackARKit {
 			}
 		}
 
+		/// <summary>
+		/// True if a packet has actually landed on the socket within the last 750ms - the same
+		/// threshold the settings panel's "Status:" line has always used, now shared with OnGUI's
+		/// always-visible overlay (see the doc comment there) so both places agree on what
+		/// "connected" means.
+		/// </summary>
+		private bool IsReceivingData() {
+			return receiver_.IsRunning &&
+			       receiver_.LastMessageTick != 0 &&
+			       Environment.TickCount - receiver_.LastMessageTick < 750;
+		}
+
 		private bool IsInPhotoMode() {
 			if (photoModeContext_ == null) {
 				// FindAnyObjectByType, not FindFirstObjectByType - we don't care which instance,
@@ -1042,9 +1117,7 @@ namespace HeadTrackARKit {
 		}
 
 		public override void OnUIDraw() {
-			bool connected = receiver_.IsRunning &&
-			                  receiver_.LastMessageTick != 0 &&
-			                  Environment.TickCount - receiver_.LastMessageTick < 750;
+			bool connected = IsReceivingData();
 
 			Kino.UI.Label("LOTA - LiDAR Over the Air (free, App Store) streams ARKit camera pose to this mod over OSC.");
 			Kino.UI.Label(connected ? "Status: receiving data" : "Status: no data (check LOTA is streaming, same Wi-Fi, matching port)");
