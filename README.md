@@ -9,6 +9,26 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.3.31** - Two changes: an automatic OSC socket rebind on a sustained outage, and a settings-panel
+toggle to hide the 0.3.29 corner status HUD.
+
+Five separate test sessions now have all shown the identical signature during a "camera stopped
+responding" report: `totalRawPacketsReceived` goes completely flat - nothing is reaching this PC's
+socket at all. Every other part of the pipeline (parsing, offset math, the Transform write, and now
+both the position AND rotation end-of-render checks) has been directly verified correct every single
+time data is actually flowing. That flat counter is consistent with LOTA genuinely not sending, but
+it's also indistinguishable, from inside this process, from the OS socket itself going stale -
+Windows can silently drop a Wi-Fi adapter's route (sleep/wake, DHCP renewal, adapter power-cycling)
+without raising an exception on a `UdpClient` that's already bound and "running." This mod has no way
+to tell those two apart just by watching the socket - but rebinding a fresh socket is cheap and safe
+either way: it changes nothing if the phone genuinely isn't sending, and might recover a stale socket
+without needing the game restarted. Now attempted automatically once 5 seconds pass with no packet,
+cooled down to at most once per 10 seconds so a real, ordinary phone-side outage can't cause a
+reconnect storm.
+
+Also adds a "Show on-screen status (top-left corner)" toggle next to Enabled in the settings panel,
+for hiding the HUD text added in 0.3.29 (e.g. while recording/streaming). Defaults to shown.
+
 **0.3.30** - Adds `maxRotationOffset`/`rotationSensitivity` to the periodic heartbeat log, next to
 the equivalent position fields that have been there since 0.3.14. A fresh 0.3.29 test log showed
 `appliedOffsetEuler` swinging by 50-120 degrees between consecutive ~2-second heartbeats while the

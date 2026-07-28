@@ -135,5 +135,20 @@ namespace HeadTrackARKit {
 		/// in screenshots. Toggle on temporarily to read/edit the real values.
 		/// </summary>
 		bool ShowSensitiveInfo { get; set; }
+
+		/// <summary>
+		/// Shows/hides the always-on corner status HUD added in 0.3.29 (PhoneCam: tracking / NO
+		/// SIGNAL / etc.). Defaults to shown (see <see cref="StatusHudDefaulted"/>) - this only
+		/// exists so it can be turned off, e.g. while recording/streaming.
+		/// </summary>
+		bool ShowStatusHud { get; set; }
+
+		/// <summary>
+		/// One-time migration flag, same pattern as <see cref="PositionSensitivityBoosted"/> - a
+		/// plain bool defaults to false (hidden) on first load, but the HUD should be ON by default
+		/// for every install, new or existing. Forces ShowStatusHud to true exactly once; toggling it
+		/// afterward always sticks.
+		/// </summary>
+		bool StatusHudDefaulted { get; set; }
 	}
 }

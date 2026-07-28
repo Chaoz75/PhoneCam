@@ -22,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.3.30", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.3.31", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.3.30";
+		private const string CurrentVersion = "0.3.31";
 
 		private const int DefaultOscPort = 9000;
 
@@ -125,6 +125,11 @@ namespace HeadTrackARKit {
 		// (both directions) gets logged clearly instead of requiring that manual diff again.
 		private bool oscSignalLost_;
 		private const int OscSignalLostThresholdMs = 2000;
+
+		// 0.3.31: see CheckOscSignalHealth's auto-restart block.
+		private int lastAutoRestartAttemptTick_;
+		private const int OscAutoRestartThresholdMs = 5000;
+		private const int OscAutoRestartCooldownMs = 10000;
 
 		// 0.3.29: every recurring "camera isn't moving" report so far has traced back to the exact
 		// same thing - LOTA stopped sending (phone screen locked/backgrounded, app closed, Wi-Fi
@@ -286,7 +291,50 @@ namespace HeadTrackARKit {
 			}
 			else if (gapMs <= OscSignalLostThresholdMs && oscSignalLost_) {
 				oscSignalLost_ = false;
+				lastAutoRestartAttemptTick_ = 0;
 				Kino.Log.Info("[HeadTrackARKit] OSC signal restored.");
+			}
+
+			// 0.3.31: every outage examined so far (five separate test sessions now) shows the same
+			// signature - TotalRawPacketsReceived goes completely flat, meaning nothing is reaching
+			// this PC's socket at all, not a parsing/game-logic problem. That's consistent with LOTA
+			// genuinely not sending, but it's ALSO exactly what a stale/orphaned OS socket looks like
+			// from here: if Windows silently drops the Wi-Fi adapter's route (sleep/wake, DHCP
+			// renewal, the adapter itself power-cycling), a UdpClient already bound to
+			// IPAddress.Any can keep reporting "running" while no longer actually receiving anything
+			// on the interface that matters, with no exception raised on this side to say so. This
+			// mod has no way to distinguish that from "the phone stopped sending" purely from inside
+			// the process - but rebinding a fresh socket is a cheap, safe thing to try either way: if
+			// the phone genuinely isn't sending, a rebind changes nothing and costs nothing; if the
+			// old socket had gone stale, a fresh bind can recover it without needing the game
+			// restarted. Gated well past the 2s warning threshold, and cooled down between attempts,
+			// so this can't spam reconnects during a real, ordinary phone-side outage.
+			if (gapMs > OscAutoRestartThresholdMs) {
+				int sinceLastAttempt = lastAutoRestartAttemptTick_ == 0
+					? int.MaxValue
+					: Environment.TickCount - lastAutoRestartAttemptTick_;
+				if (sinceLastAttempt > OscAutoRestartCooldownMs) {
+					lastAutoRestartAttemptTick_ = Environment.TickCount;
+					Kino.Log.Warning(
+						$"[HeadTrackARKit] Still no data after {gapMs / 1000}s - rebinding the OSC socket " +
+						"in case it went stale (won't help if LOTA genuinely isn't sending, but costs nothing to try).");
+					RestartReceiver();
+				}
+			}
+		}
+
+		/// <summary>
+		/// 0.3.31: see the doc comment on the auto-restart block in <see cref="CheckOscSignalHealth"/>.
+		/// Stops and re-creates the OSC socket on the same port, without touching calibration or any
+		/// saved settings - purely a "what if the socket itself went stale" recovery attempt.
+		/// </summary>
+		private void RestartReceiver() {
+			try {
+				receiver_.Start(config_.OscPort);
+				Kino.Log.Info("[HeadTrackARKit] OSC socket rebound.");
+			}
+			catch (Exception ex) {
+				Kino.Log.Error($"[HeadTrackARKit] Failed to rebind OSC socket: {ex.Message}");
 			}
 		}
 
@@ -315,7 +363,7 @@ namespace HeadTrackARKit {
 		/// able status indicator, not a replacement for the settings panel's fuller detail.
 		/// </summary>
 		private void OnGUI() {
-			if (!config_.Enabled) return;
+			if (!config_.Enabled || !config_.ShowStatusHud) return;
 
 			string text;
 			Color color;
@@ -1120,6 +1168,11 @@ namespace HeadTrackARKit {
 				config_.PositionRangeUpgraded = true;
 			}
 
+			if (!config_.StatusHudDefaulted) {
+				config_.ShowStatusHud = true;
+				config_.StatusHudDefaulted = true;
+			}
+
 			if (config_.ZoomSensitivity <= 0) config_.ZoomSensitivity = 1.5f;
 			if (config_.MaxZoomOffset <= 0) config_.MaxZoomOffset = 30f;
 			if (config_.ZoomSmoothing <= 0) config_.ZoomSmoothing = 0.2f;
@@ -1196,6 +1249,13 @@ namespace HeadTrackARKit {
 				else {
 					receiver_.Stop();
 				}
+			}
+
+			// 0.3.31: requested option to hide the always-on corner status text (see OnGUI) - e.g.
+			// while recording/streaming, or just for a cleaner screen once you trust it's working.
+			bool showStatusHud = config_.ShowStatusHud;
+			if (Kino.UI.Toggle("Show on-screen status (top-left corner)", ref showStatusHud)) {
+				config_.ShowStatusHud = showStatusHud;
 			}
 
 			if (Kino.UI.Input(ref portText_, 5, "^[0-9]{1,5}$")) {
