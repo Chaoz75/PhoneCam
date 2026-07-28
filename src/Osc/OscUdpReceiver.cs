@@ -54,19 +54,45 @@ namespace HeadTrackARKit.Osc {
 
 		public event Action<Exception> OnError;
 
+		// 0.3.28: every real test session so far has hit the same pattern - OSC data arrives
+		// fine, then goes completely silent for anywhere from a few seconds to a full minute,
+		// often starting within seconds of calibrating. The raw-packet counter (0.3.24) already
+		// proved this isn't a parsing bug - literally nothing reaches the socket during these
+		// gaps. Two cheap, safe changes that directly target how resilient THIS SIDE of the
+		// connection is to a brief stall, in case a Unity/engine hitch (scene transitions,
+		// entering a session, GC pauses under load - all things that tend to cluster right around
+		// when someone's actively testing, e.g. right after F9) is briefly starving this thread
+		// long enough for the OS's default-sized UDP receive buffer to overflow and silently drop
+		// datagrams that arrived during the stall, before this thread got back around to reading
+		// them:
+		//
+		// 1. A much larger ReceiveBufferSize (1 MiB, vs whatever small OS default was previously
+		//    left in place) gives far more headroom - at a typical ARKit pose-stream rate and
+		//    packet size, that's many seconds' worth of buffered datagrams instead of a fraction
+		//    of one, so a brief hitch drains without losing data once this thread resumes.
+		// 2. Bumping this thread's priority above normal makes the OS scheduler less likely to
+		//    starve it of CPU time during exactly the kind of load spike (scene load, physics/GC
+		//    pressure) that would otherwise delay it long enough to matter.
+		//
+		// Neither of these can fix a *sustained* outage where the phone itself genuinely stops
+		// transmitting for 30+ seconds (screen lock, backgrounding, actually leaving Wi-Fi range) -
+		// no receive-side buffering survives the sender not sending at all. But they're a real,
+		// free improvement against shorter engine-side hitches, and cost nothing to try.
 		public void Start(int port) {
 			Stop();
 
 			Port = port;
 			client_ = new UdpClient(AddressFamily.InterNetwork);
 			client_.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+			client_.Client.ReceiveBufferSize = 1024 * 1024;
 			client_.Client.Bind(new IPEndPoint(IPAddress.Any, port));
 			client_.Client.ReceiveTimeout = 1000;
 
 			running_ = true;
 			thread_ = new Thread(ReceiveLoop) {
 				IsBackground = true,
-				Name = "HeadTrackARKit-OscReceiver"
+				Name = "HeadTrackARKit-OscReceiver",
+				Priority = ThreadPriority.AboveNormal
 			};
 			thread_.Start();
 		}

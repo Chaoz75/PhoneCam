@@ -9,6 +9,36 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.3.28** - Hardens the OSC receiver against short stalls, and separately flags a real "wrong
+moment to calibrate" finding from the latest test log.
+
+Every real test session so far has hit the same pattern: data streams fine, then goes completely
+silent - anywhere from a couple seconds to a full minute - often starting within seconds of
+pressing F9. The 0.3.24 raw-packet counter already proved this isn't a parsing bug (literally zero
+datagrams reach the socket during these gaps). Two cheap, safe changes now make the receiving side
+more resilient to a *brief* stall, in case an engine-side hitch (scene transitions, entering a
+session, GC pressure - all things that tend to cluster right around active testing) is briefly
+starving the receive thread long enough for the OS's default-sized UDP buffer to overflow and
+silently drop datagrams that arrived during the stall:
+
+- `OscUdpReceiver`'s socket now requests a 1 MiB receive buffer (previously left at whatever small
+  OS default), giving many seconds of headroom instead of a fraction of one.
+- The receive thread's priority is raised to `AboveNormal`, making the OS scheduler less likely to
+  starve it of CPU time during a load spike.
+
+Neither change can fix a *sustained* outage where the phone itself genuinely stops transmitting for
+30+ seconds (screen lock, backgrounding, actually leaving Wi-Fi range) - no amount of receive-side
+buffering survives the sender not sending at all. But it's a real, free improvement against shorter
+hitches, worth having regardless.
+
+Separately: the log that prompted this also showed `cameraWorldPosAfterWrite` at
+`(x=-143.36, y=354.61, z=-158.14)` right after calibrating - 354 meters in the air, unlike every
+previous log (always in the -2 to -8 range on each axis). Since the tracked offset itself was tiny
+at that moment, that number is almost entirely CarX's own camera position, not this mod's - meaning
+whatever camera was active at the moment of calibration wasn't actually the driving view (more
+likely a loading/transition/flythrough camera). Calibrating at the wrong moment isn't a bug to fix
+in code, just a reminder that F9 should be pressed once actually seated in the driving view.
+
 **0.3.27** - Reverts the 0.3.25 free-cam rework's core mechanism after a real report of the camera
 "not working" following calibration. Root cause: 0.3.25 anchored the camera to a fixed WORLD-SPACE
 position/rotation captured at the moment of F9, then rebuilt the camera's entire pose from that
