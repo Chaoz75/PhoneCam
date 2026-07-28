@@ -34,6 +34,7 @@
 	    UnityEngine.InputLegacyModule.dll    (needed for UnityEngine.Input - scroll wheel zoom)
 	    UnityEngine.UnityWebRequestModule.dll (needed for UnityWebRequest - the update checker)
 	    UnityEngine.JSONSerializeModule.dll   (needed for JsonUtility - parses GitHub's response)
+	    UnityEngine.IMGUIModule.dll          (needed for OnGUI/GUIStyle - 0.3.29's on-screen status HUD)
 
 	  Both live in:
 	    <CarX install>\Drift Racing Online_Data\Managed\
@@ -75,6 +76,10 @@
 		</Reference>
 		<Reference Include="UnityEngine.JSONSerializeModule">
 			<HintPath>libs\UnityEngine.JSONSerializeModule.dll</HintPath>
+			<Private>false</Private>
+		</Reference>
+		<Reference Include="UnityEngine.IMGUIModule">
+			<HintPath>libs\UnityEngine.IMGUIModule.dll</HintPath>
 			<Private>false</Private>
 		</Reference>
 		<Reference Include="Assembly-CSharp">
