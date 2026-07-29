@@ -150,5 +150,14 @@ namespace HeadTrackARKit {
 		/// afterward always sticks.
 		/// </summary>
 		bool StatusHudDefaulted { get; set; }
+
+		/// <summary>
+		/// One-time migration flag, same pattern as <see cref="PositionSensitivityBoosted"/>. The
+		/// mod's goal is a camera that moves *identically* to the real phone; a saved
+		/// RotationSensitivity above 1.0 (a real config was carrying 2.16x) is by definition not 1:1
+		/// and was turning ordinary head movement into violent view swings. Forces
+		/// RotationSensitivity back to exactly 1.0 once on 0.4.0+, regardless of the saved value.
+		/// </summary>
+		bool RotationSensitivityUnityGained { get; set; }
 	}
 }

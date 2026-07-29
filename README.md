@@ -9,6 +9,89 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.4.0** - Replaces the camera control architecture with a car-anchored rig. This is the fix for
+the long-running "objects move but my camera doesn't" report.
+
+### Root cause
+
+Every version from 0.3.8 through 0.3.31 applied tracking as an *additive perturbation* on top of
+whatever CarX's own camera solve produced that frame:
+
+```csharp
+t.position += t.rotation * posOffset;
+t.rotation  = t.rotation * rotOffset;
+```
+
+Three properties of that are wrong for a handheld-camera feel, and together they produce exactly the
+reported symptom:
+
+1. **The rotation term spins the camera about its own pivot - it does not move it.** In chase cam the
+   camera sits several meters behind the car. Rotating it in place doesn't take it anywhere, it just
+   aims it somewhere else, so the scene sweeps across the screen while the camera itself never
+   travels. That *is* "stuff moves but my camera doesn't." Measured in the validation harness: a 30
+   degree look under the additive path moves the camera **0.00 m**.
+2. **The baseline was a moving target.** `Assembly-CSharp` shows CarX's chase cam
+   (`CarX.FollowCamera`) is Cinemachine-driven (`m_virtualCamera`) and carries its own sway and
+   damping state (`m_SwaySpeed`, `m_BaseSwayAmount`, `m_TrackingSwayAmount`, `m_CurrentVelocityOffset`,
+   `m_FollowSpeed`). Composing a delta onto a baseline that is itself swinging every frame gives a
+   chaotic result rather than one that tracks the phone.
+3. **Scale mismatch.** Tracked translation is centimeters to decimeters; the chase boom is meters. A
+   6 cm shift on a 5 m boom is invisible, while the rotation term (clamped at up to 120 degrees, and
+   multiplied by a saved 2.16x sensitivity) threw the view violently. Net effect: lots of world
+   sweep, no sense of camera travel.
+
+This also explains why every diagnostic ever added kept reporting "correct." They were all measuring
+whether the write reached the render matrix - and it always did, faithfully. The write was landing
+exactly as computed; it was the *formulation* that couldn't produce camera travel in the first place.
+
+### The fix
+
+Stop perturbing CarX's result. Reconstruct the pose outright, anchored to the **car's** transform
+rather than the world. `Calibrate()` (F9) now records where the camera sits *in the car's local
+frame*, and each frame the pose is rebuilt from the car's current transform:
+
+```csharp
+Vector3    basePosition = car.TransformPoint(anchorLocalPosition_);
+Quaternion baseRotation = car.rotation * anchorLocalRotation_;
+t.position = basePosition + baseRotation * posOffset;
+t.rotation = baseRotation * rotOffset;
+```
+
+- Car following comes for free, because the anchor is car-local. This is the specific difference from
+  0.3.25's reverted fixed *world*-space anchor, where the camera stayed put as the car drove away.
+- Motion is true 1:1 6DOF, because the pose is defined absolutely rather than as a delta.
+- CarX's sway and damping can no longer fight it, because the rig never reads their output.
+
+The car is resolved through a layered lookup, most authoritative first: `CameraSwitch.GetCar()`, then
+`CameraSwitch.targetRaceCar` (both confirmed public, instance, zero-parameter in `Assembly-CSharp`),
+then the `m_raceCar` / `m_car` / `m_playerCarControl` backing fields, then the active `BaseCamera`'s
+`m_target`. Reflection is used deliberately so a future game update renaming any of these degrades
+gracefully instead of hard-failing.
+
+**Outside a car** (garage, menus, spectating) no anchor can exist, so the mod automatically falls back
+to the previous additive behaviour and keeps working. The on-screen HUD and the heartbeat log both
+state which mode is live: `tracking (car-anchored rig)` vs `tracking (no car - additive fallback)`.
+
+`RotationSensitivity` is also reset once to exactly **1.0**. The goal is a camera that moves
+*identically* to the phone; the saved 2.16x was by definition not 1:1 and was turning a 30 degree real
+turn into a 65 degree swing.
+
+### Validation
+
+`rig_validation.py` reproduces the exact arithmetic (Unity quaternion/Transform semantics) and checks
+the properties that matter over a 240-frame simulated drive. All six pass at machine precision:
+
+| # | Check | Result |
+|---|-------|--------|
+| T1 | Rig follows the car with zero tracking input | 0.00e+00 m deviation (0.3.25 world anchor, for contrast: **68 m adrift**) |
+| T2 | Translation is exactly 1:1 in the anchor frame | 7.2e-15 m max error |
+| T3 | Rotation applies exactly the requested delta | 2.5e-14 deg max error |
+| T4 | Constant phone pose gives constant camera pose (no drift) | 5.4e-15 m max wander |
+| T5 | Rig is stable where the additive path is not (phone held still) | rig 8.6e-15 m vs additive 3.3e-03 m frame-to-frame jitter |
+| T6 | Additive rotation moves the camera 0 m (the root cause) | additive **0.00e+00 m**; rig 0.5 m lean gives 0.500 m travel |
+
+This validates the algorithm, not the compiled binary - it cannot substitute for a run in-game.
+
 **0.3.31** - Two changes: an automatic OSC socket rebind on a sustained outage, and a settings-panel
 toggle to hide the 0.3.29 corner status HUD.
 

@@ -22,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.3.31", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.4.0", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.3.31";
+		private const string CurrentVersion = "0.4.0";
 
 		private const int DefaultOscPort = 9000;
 
@@ -70,6 +70,63 @@ namespace HeadTrackARKit {
 
 		private Camera cachedCamera_;
 		private float cameraCacheTime_;
+
+		// --- 0.4.0: car-anchored camera rig ---
+		//
+		// ROOT CAUSE this replaces. Every version from 0.3.8 through 0.3.31 applied tracking as an
+		// ADDITIVE perturbation on top of whatever CarX's own camera solve produced that frame:
+		//
+		//     t.position += t.rotation * posOffset;
+		//     t.rotation  = t.rotation * rotOffset;
+		//
+		// Three things about that are wrong for a handheld-phone-camera feel, and together they
+		// produce exactly the reported symptom ("the world moves but my camera doesn't"):
+		//
+		// 1. The rotation term spins the camera about its OWN pivot. In chase cam the camera sits
+		//    several meters behind the car; rotating it in place doesn't move it anywhere, it just
+		//    aims it somewhere else. The scene sweeps across the screen while the camera itself
+		//    never travels - which is precisely "stuff moves but the camera doesn't."
+		// 2. The baseline is a moving target. Assembly-CSharp shows CarX's chase cam
+		//    (CarX.FollowCamera) is Cinemachine-driven (m_virtualCamera) and carries its own sway
+		//    and damping state (m_SwaySpeed, m_BaseSwayAmount, m_TrackingSwayAmount,
+		//    m_CurrentVelocityOffset, m_FollowSpeed). Composing our delta onto a baseline that is
+		//    itself swinging makes the result chaotic rather than 1:1 with the phone.
+		// 3. Scale mismatch. Tracked translation is centimeters-to-decimeters; chase cam sits meters
+		//    out. A 6 cm shift on a 5 m boom is invisible, while the rotation term (clamped at up to
+		//    120 degrees, previously multiplied by a 2.16x saved sensitivity) throws the view wildly.
+		//    So the user gets violent world-sweep and no sense of camera travel at all.
+		//
+		// THE FIX: stop perturbing CarX's result and instead reconstruct the camera pose outright,
+		// anchored to the CAR's transform rather than the world. At calibration we record where the
+		// camera is *in the car's local frame*; every frame we rebuild the full pose from the car's
+		// CURRENT transform plus that stored local pose plus the tracked delta. That gives:
+		//   - car following for free (car-local, so none of 0.3.25's world-anchor breakage where the
+		//     camera stayed put as the car drove away),
+		//   - true 1:1 6DOF handheld motion, because we define the pose absolutely,
+		//   - immunity to CarX's own sway/damping fighting us, because we no longer build on it.
+		//
+		// If no car can be resolved (garage, menus, spectating, replay with no target) this falls
+		// back to the previous additive behaviour automatically, so the mod still does something
+		// sensible outside a car - see ResolveCarTransform and the fallback in OnCameraPreCull.
+		private Transform carTransform_;
+		private float carCacheTime_;
+		private Vector3 anchorLocalPosition_;
+		private Quaternion anchorLocalRotation_ = Quaternion.identity;
+		private bool hasCarAnchor_;
+
+		// Resolved off Assembly-CSharp's own metadata rather than guessed: CameraSwitch.GetCar() and
+		// CameraSwitch.targetRaceCar are both public, instance, zero-parameter members, and the
+		// RaceCar type they hand back is a MonoBehaviour (so .transform is reachable via Component).
+		// Reflection rather than a direct call is deliberate - it keeps this compiling and degrading
+		// gracefully if a game update renames or reshapes any of them, instead of hard-failing.
+		private static readonly MethodInfo CameraSwitchGetCarMethod =
+			typeof(CameraSwitch).GetMethod("GetCar", BindingFlags.Public | BindingFlags.Instance, null, Type.EmptyTypes, null);
+		private static readonly PropertyInfo CameraSwitchTargetRaceCarProperty =
+			typeof(CameraSwitch).GetProperty("targetRaceCar", BindingFlags.Public | BindingFlags.Instance);
+
+		// Private backing fields on CameraSwitch, in the order they're worth trying if both public
+		// accessors above come back empty (e.g. mid-transition, before the public target is set).
+		private static readonly string[] CameraSwitchCarFieldNames = { "m_raceCar", "m_car", "m_playerCarControl" };
 
 		// UIPhotoModeContext and its public "isActive" property were confirmed by directly
 		// inspecting Assembly-CSharp.dll - both are public, so no reflection is needed. The
@@ -386,7 +443,11 @@ namespace HeadTrackARKit {
 				color = Color.yellow;
 			}
 			else {
-				text = "PhoneCam: tracking";
+				// 0.4.0: distinguishes the two camera modes on screen, so "is the rig actually
+				// driving my camera" is answerable at a glance instead of only from the log.
+				text = (hasCarAnchor_ && GetCarTransform() != null)
+					? "PhoneCam: tracking (car-anchored rig)"
+					: "PhoneCam: tracking (no car - additive fallback, press F9 in a car)";
 				color = Color.green;
 			}
 
@@ -522,7 +583,34 @@ namespace HeadTrackARKit {
 			}
 
 			state_.Calibrate();
-			Kino.Log.Info("[HeadTrackARKit] Neutral position set.");
+
+			// 0.4.0: capture where the camera currently sits IN THE CAR'S OWN LOCAL FRAME, which is
+			// what makes the rig follow the car for free without inheriting CarX's per-frame sway.
+			// Storing it car-local (rather than 0.3.25's fixed world-space anchor) is the whole
+			// difference between "camera rides along with the car" and "camera stays behind in empty
+			// space watching the car drive off," which is what made 0.3.25 unusable.
+			hasCarAnchor_ = false;
+			carTransform_ = null; // force a fresh resolve rather than trusting a stale cache here
+			Transform car = GetCarTransform();
+			Camera cam = GetActiveCamera();
+
+			if (car != null && cam != null) {
+				Transform camTransform = cam.transform;
+				anchorLocalPosition_ = car.InverseTransformPoint(camTransform.position);
+				anchorLocalRotation_ = Quaternion.Inverse(car.rotation) * camTransform.rotation;
+				hasCarAnchor_ = true;
+				Kino.Log.Info(
+					$"[HeadTrackARKit] Neutral position set - car-anchored rig active " +
+					$"(camera at {FormatVector(anchorLocalPosition_)} in car-local space, car='{car.name}').");
+			}
+			else {
+				// No car right now (garage, menus, spectating). Tracking still works via the additive
+				// fallback in OnCameraPreCull - just without car-relative anchoring, since there's
+				// nothing to anchor to.
+				Kino.Log.Info(
+					"[HeadTrackARKit] Neutral position set - no car resolved, using additive fallback " +
+					"(tracking still active; re-press F9 once in a car for the full rig).");
+			}
 		}
 
 		private void OnCameraPreCull(Camera cam) {
@@ -585,14 +673,42 @@ namespace HeadTrackARKit {
 
 				Transform t = cam.transform;
 
-				if (config_.ClippingGuardEnabled && posOffset.sqrMagnitude > 1e-6f) {
-					posOffset = ApplyClippingGuard(t.position, t.rotation, posOffset);
+				// 0.4.0: the car-anchored rig - see the big comment on the anchor fields for why this
+				// replaces the old additive write. Both branches below produce a final pose; the rig
+				// branch builds it outright from the car, the fallback keeps the historical additive
+				// behaviour for when there's no car to anchor to.
+				Transform car = hasCarAnchor_ ? GetCarTransform() : null;
+
+				if (car != null) {
+					// Where the camera should sit this frame, ignoring tracking: the calibration-time
+					// pose, carried along by the car's CURRENT transform. This is what makes the rig
+					// follow the car without ever reading (and therefore without ever fighting) what
+					// CarX's own Cinemachine solve just wrote.
+					Vector3 basePosition = car.TransformPoint(anchorLocalPosition_);
+					Quaternion baseRotation = car.rotation * anchorLocalRotation_;
+
+					if (config_.ClippingGuardEnabled && posOffset.sqrMagnitude > 1e-6f) {
+						posOffset = ApplyClippingGuard(basePosition, baseRotation, posOffset);
+					}
+
+					lastAppliedPosOffset_ = posOffset;
+
+					// Translation is expressed in the anchor's own frame, so "lean left" is always
+					// left relative to how the camera was aimed at calibration - not relative to
+					// whatever direction the camera happens to have swung to since.
+					t.position = basePosition + baseRotation * posOffset;
+					t.rotation = baseRotation * rotOffset;
 				}
+				else {
+					if (config_.ClippingGuardEnabled && posOffset.sqrMagnitude > 1e-6f) {
+						posOffset = ApplyClippingGuard(t.position, t.rotation, posOffset);
+					}
 
-				lastAppliedPosOffset_ = posOffset;
+					lastAppliedPosOffset_ = posOffset;
 
-				t.position += t.rotation * posOffset;
-				t.rotation = t.rotation * rotOffset;
+					t.position += t.rotation * posOffset;
+					t.rotation = t.rotation * rotOffset;
+				}
 
 				// 0.3.17: ground-truth check for the "stepping left does nothing" report - logs
 				// the camera's ACTUAL world position right after this mod wrote to it, so a test
@@ -840,6 +956,15 @@ namespace HeadTrackARKit {
 				Kino.Log.Info(
 					$"[HeadTrackARKit][diag] maxRotationOffset={config_.MaxRotationOffset:F2} " +
 					$"rotationSensitivity={config_.RotationSensitivity:F2}");
+				// 0.4.0: which camera mode is actually in effect. "rig" means the car-anchored
+				// reconstruction is driving the camera; "additive-fallback" means no car could be
+				// resolved so the old behaviour is in play. If this ever reads additive-fallback
+				// while seated in a car, ResolveCarTransform is what needs looking at, not the math.
+				Transform diagCar = hasCarAnchor_ ? GetCarTransform() : null;
+				Kino.Log.Info(
+					$"[HeadTrackARKit][diag] cameraMode={(diagCar != null ? "rig(car-anchored)" : "additive-fallback")} " +
+					$"hasCarAnchor={hasCarAnchor_} car={(diagCar != null ? diagCar.name : "(none)")} " +
+					$"anchorLocalPos={FormatVector(anchorLocalPosition_)}");
 				// Position diagnostics (0.3.14) - see the field comments on lastRawArPosition_/
 				// lastAppliedPosOffset_ for why this exists.
 				Kino.Log.Info(
@@ -884,6 +1009,112 @@ namespace HeadTrackARKit {
 			return receiver_.IsRunning &&
 			       receiver_.LastMessageTick != 0 &&
 			       Environment.TickCount - receiver_.LastMessageTick < 750;
+		}
+
+		/// <summary>
+		/// The Transform this mod anchors the camera rig to - the player's current car - or null if
+		/// there isn't one right now (garage, menus, or any state where CameraSwitch has no target).
+		/// Cached for a second at a time, same reasoning as <see cref="GetMainCamera"/>: this is
+		/// consulted from a per-camera render callback, so it must not do reflection every call.
+		/// </summary>
+		private Transform GetCarTransform() {
+			// Unity's overloaded == makes a destroyed object compare equal to null, so this also
+			// correctly re-resolves after a car is despawned rather than holding a dead reference.
+			if (carTransform_ != null && Time.unscaledTime - carCacheTime_ < 1f) {
+				return carTransform_;
+			}
+
+			carCacheTime_ = Time.unscaledTime;
+			carTransform_ = ResolveCarTransform();
+			return carTransform_;
+		}
+
+		/// <summary>
+		/// Layered lookup for the player's car Transform, most-authoritative first. Every layer is
+		/// wrapped so a failure in one falls through to the next rather than throwing into game code.
+		/// </summary>
+		private static Transform ResolveCarTransform() {
+			CameraSwitch cameraSwitch = CameraSwitch.instance;
+			if (cameraSwitch == null) return null;
+
+			// 1. The public accessors, confirmed present and zero-parameter in Assembly-CSharp.
+			Transform fromMethod = AsTransform(SafeInvoke(CameraSwitchGetCarMethod, cameraSwitch));
+			if (fromMethod != null) return fromMethod;
+
+			Transform fromProperty = AsTransform(SafeGetProperty(CameraSwitchTargetRaceCarProperty, cameraSwitch));
+			if (fromProperty != null) return fromProperty;
+
+			// 2. Private backing fields, for states where the public target isn't populated yet.
+			foreach (string fieldName in CameraSwitchCarFieldNames) {
+				FieldInfo field = typeof(CameraSwitch).GetField(fieldName, BindingFlags.NonPublic | BindingFlags.Instance);
+				if (field == null) continue;
+				Transform fromField = AsTransform(SafeGetField(field, cameraSwitch));
+				if (fromField != null) return fromField;
+			}
+
+			// 3. Whatever the active camera controller is aiming at. BaseCamera-derived controllers
+			//    keep their follow target in m_target (confirmed on CarX.FollowCamera), which is the
+			//    car (or a rig node parented under it) in every mode that has one.
+			CarX.BaseCamera active = cameraSwitch.FindActiveCamera();
+			if (active != null) {
+				FieldInfo targetField = active.GetType().GetField("m_target", BindingFlags.NonPublic | BindingFlags.Instance);
+				if (targetField != null) {
+					Transform fromTarget = AsTransform(SafeGetField(targetField, active));
+					if (fromTarget != null) return fromTarget;
+				}
+			}
+
+			return null;
+		}
+
+		private static object SafeInvoke(MethodInfo method, object target) {
+			if (method == null || target == null) return null;
+			try {
+				return method.Invoke(target, null);
+			}
+			catch {
+				return null;
+			}
+		}
+
+		private static object SafeGetProperty(PropertyInfo property, object target) {
+			if (property == null || target == null || !property.CanRead) return null;
+			try {
+				return property.GetValue(target, null);
+			}
+			catch {
+				return null;
+			}
+		}
+
+		private static object SafeGetField(FieldInfo field, object target) {
+			if (field == null || target == null) return null;
+			try {
+				return field.GetValue(target);
+			}
+			catch {
+				return null;
+			}
+		}
+
+		/// <summary>
+		/// Coerces whatever a car accessor handed back into a Transform, accepting the three shapes
+		/// it can realistically be (a Transform, any Component on the car, or the GameObject itself)
+		/// so this doesn't depend on the exact declared return type staying put across game updates.
+		/// </summary>
+		private static Transform AsTransform(object value) {
+			switch (value) {
+				case null:
+					return null;
+				case Transform transform:
+					return transform != null ? transform : null;
+				case GameObject gameObject:
+					return gameObject != null ? gameObject.transform : null;
+				case Component component:
+					return component != null ? component.transform : null;
+				default:
+					return null;
+			}
 		}
 
 		private bool IsInPhotoMode() {
@@ -1166,6 +1397,19 @@ namespace HeadTrackARKit {
 			if (!config_.PositionRangeUpgraded) {
 				config_.MaxPositionOffset = 3.0f;
 				config_.PositionRangeUpgraded = true;
+			}
+
+			// 0.4.0: the stated goal for this mod is that the in-game camera moves *identically* to
+			// the real phone - i.e. genuinely 1:1. A saved RotationSensitivity of 2.16x (what a real
+			// config was carrying, visible in the 0.3.30 heartbeat) is by definition not 1:1: a 30
+			// degree real-world turn was arriving as a 65 degree camera swing, which is a large part
+			// of why the view felt like it was being thrown around rather than held. Reset to exactly
+			// 1.0 once, via the same one-time-migration pattern as the position-sensitivity fixes
+			// above (a plain "<= 0" unset check can't catch an already-set 2.16). Tuning the slider
+			// afterward always sticks.
+			if (!config_.RotationSensitivityUnityGained) {
+				config_.RotationSensitivity = 1.0f;
+				config_.RotationSensitivityUnityGained = true;
 			}
 
 			if (!config_.StatusHudDefaulted) {
