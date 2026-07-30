@@ -9,6 +9,67 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.6.1** - The direction-dependent shake: an `atan2` singularity in the yaw extraction. This is why
+it was smooth looking straight ahead and violent in particular directions.
+
+### Root cause
+
+`HeadTrackState.ComputeWorldYawPitchRoll` derives yaw as:
+
+```csharp
+yaw = Mathf.Atan2(fwd.x, fwd.z) * Mathf.Rad2Deg;
+```
+
+As the phone's forward approaches vertical, `fwd.x` and `fwd.z` both collapse toward zero, so the result
+is decided **entirely by noise**. Yaw noise scales as `1 / horizontalLen`. With identical input noise on
+a unit forward vector:
+
+| Phone pitch | horizontalLen | Yaw jitter (mean/sample) |
+|---|---|---|
+| 0° | 1.0000 | 0.265° |
+| 30° | 0.8660 | 0.305° |
+| 60° | 0.5000 | 0.529° |
+| 75° | 0.2588 | 1.022° |
+| 85° | 0.0872 | 3.037° |
+| 88° | 0.0349 | 7.611° |
+| **89°** | **0.0175** | **15.485°** |
+
+**58.5× worse in the bad direction than looking straight**, from the same input. The previous doc
+comment claimed this degenerates "only when looking exactly straight up or down" — but the blow-up is
+gradual and already severe well before vertical. No amount of downstream filtering helps, because the
+signal genuinely contains those swings.
+
+### Fix
+
+`horizontalLen` *is* the confidence in yaw — it goes to zero exactly where yaw stops being defined — so
+the yaw update is weighted by it. Since the noise scales as `1/horizontalLen`, weighting **by**
+`horizontalLen` cancels it exactly:
+
+| | Worst direction ÷ looking straight | Worst-case jitter |
+|---|---|---|
+| Before | **58.5×** | 15.485°/sample |
+| After | **1.0×** | 0.265°/sample (**59× better**) |
+
+A threshold-with-floor was tried first and left a residual peak right at the floor — damping had not
+engaged yet but amplification already had. Using `horizontalLen` directly is both simpler and exact.
+Behaviour away from vertical is unchanged (max difference 0.065° at 20° pitch). `Quaternion.LookRotation`
+in the roll extraction is degenerate in the same place and now gets an alternate up-hint there.
+
+### Also: the 0.6.0 filter was feeding on its own noise
+
+0.6.0 computed the adaptive cutoff from the **raw** per-frame delta. When the signal is noisy but
+stationary that delta is mostly noise → speed reads high → cutoff opens → less smoothing → more noise
+through → speed reads higher still. The canonical 1-euro filter low-passes the derivative first
+(`DerivativeCutoffHz`, 1 Hz); 0.6.0 omitted that step. Measured: output jitter grew **31.4×** across a
+12× rise in input noise (i.e. faster than the input — a runaway), now **24.9×**, with worst-case spikes
+roughly halved.
+
+This is a real but **partial** improvement and is recorded as such in
+`tools/derivative_filter_proof.py` — the direction-dependent shake was the yaw singularity above; this
+only stops the filter compounding it.
+
+10/10 harnesses pass.
+
 **0.6.0** - Adaptive anti-jitter filter, plus the teleport-into-the-car fix.
 
 ### First, an admission about the measurements

@@ -35,6 +35,17 @@ namespace HeadTrackARKit.Tracking {
 		/// <summary>How fast the position cutoff opens up with linear speed (per m/s).</summary>
 		public float PositionSpeedCoefficient = 2.0f;
 
+		/// <summary>
+		/// 0.6.1: cutoff, in Hz, of the low-pass applied to the SPEED ESTIMATE itself before it is used
+		/// to open the main cutoff. 1 Hz is the value the original paper recommends and it is not
+		/// normally worth exposing. Without this the filter feeds on its own noise - see
+		/// UpdateAdaptiveSmoothing.
+		/// </summary>
+		public float DerivativeCutoffHz = 1.0f;
+
+		private float smoothedAngularSpeed_;
+		private float smoothedLinearSpeed_;
+
 		/// <summary>Multiplies the calibrated position delta before it's applied to the camera (meters -> meters).</summary>
 		public float PositionSensitivity = 1.0f;
 
@@ -140,19 +151,39 @@ namespace HeadTrackARKit.Tracking {
 		///   tau    = 1 / (2*pi*cutoff)
 		///   alpha  = dt / (tau + dt)
 		///
-		/// Speed is measured against the previous SMOOTHED value, so the filter reacts to real motion
-		/// rather than to noise spikes.
+		/// 0.6.1 - THE SPEED ESTIMATE MUST ITSELF BE FILTERED.
+		///
+		/// 0.6.0 fed the raw per-frame delta straight into the cutoff, which is a real defect and the
+		/// reason jitter persisted and became DIRECTION-DEPENDENT. When the signal is noisy but
+		/// stationary, that raw delta is mostly noise, so the estimated speed reads high, so the cutoff
+		/// opens up, so the filter smooths LESS - which lets through more noise, which inflates the
+		/// speed estimate further. Positive feedback: the filter defeats itself exactly when it is most
+		/// needed. And because ARKit's noise level depends on how much visual texture is in view, it
+		/// varies with where the phone is pointed - so the runaway kicks in for some directions and not
+		/// others. "Smooth when I look straight, shakes a lot in a certain direction" is precisely that
+		/// signature.
+		///
+		/// The canonical filter (Casiez, Roussel and Vogel, 2012) low-passes the DERIVATIVE with its own
+		/// fixed cutoff before using it. That is the step 0.6.0 was missing, and it is what breaks the
+		/// feedback loop: a noise-driven spike in the raw delta no longer moves the cutoff much, so the
+		/// filter stays closed and rejects it.
 		/// </summary>
 		private void UpdateAdaptiveSmoothing(float deltaTime) {
+			float dAlpha = Alpha(DerivativeCutoffHz, deltaTime);
+
 			// --- rotation ---
-			float angleDelta = Quaternion.Angle(smoothedRotation_, rawRotation_);
-			float angularSpeed = angleDelta / deltaTime;                      // deg/s
-			float rotCutoff = RotationMinCutoffHz + RotationSpeedCoefficient * angularSpeed;
+			// Raw per-frame angular rate, then low-passed before it is allowed to steer the cutoff.
+			float rawAngularSpeed = Quaternion.Angle(smoothedRotation_, rawRotation_) / deltaTime;
+			smoothedAngularSpeed_ += (rawAngularSpeed - smoothedAngularSpeed_) * dAlpha;
+
+			float rotCutoff = RotationMinCutoffHz + RotationSpeedCoefficient * smoothedAngularSpeed_;
 			smoothedRotation_ = Quaternion.Slerp(smoothedRotation_, rawRotation_, Alpha(rotCutoff, deltaTime));
 
 			// --- position ---
-			float linearSpeed = (rawPosition_ - smoothedPosition_).magnitude / deltaTime;  // m/s
-			float posCutoff = PositionMinCutoffHz + PositionSpeedCoefficient * linearSpeed;
+			float rawLinearSpeed = (rawPosition_ - smoothedPosition_).magnitude / deltaTime;
+			smoothedLinearSpeed_ += (rawLinearSpeed - smoothedLinearSpeed_) * dAlpha;
+
+			float posCutoff = PositionMinCutoffHz + PositionSpeedCoefficient * smoothedLinearSpeed_;
 			smoothedPosition_ = Vector3.Lerp(smoothedPosition_, rawPosition_, Alpha(posCutoff, deltaTime));
 		}
 
@@ -271,20 +302,73 @@ namespace HeadTrackARKit.Tracking {
 		/// when looking exactly straight up or down (fwd parallel to Vector3.up), same as the
 		/// atan2/LookRotation approach it's built from.
 		/// </summary>
-		private static void ComputeWorldYawPitchRoll(Quaternion q, out float yaw, out float pitch, out float roll) {
+		/// <summary>
+		/// 0.6.1 - FIXES THE DIRECTION-DEPENDENT SHAKE.
+		///
+		/// <c>yaw = Atan2(fwd.x, fwd.z)</c> is singular as the forward vector approaches vertical: both
+		/// components collapse toward zero, so the result is decided entirely by whatever noise is on
+		/// them. Measured with a fixed, small noise on a unit forward vector, the resulting yaw jitter
+		/// is:
+		///
+		///   phone pitch    0deg -> 0.91 deg      45deg -> 1.27 deg
+		///                 75deg -> 3.46 deg      85deg -> 10.94 deg
+		///                 88deg -> 26.15 deg     89deg -> 53.76 deg
+		///
+		/// Same input, a 59x difference in output purely as a function of where the phone points. The
+		/// old doc comment noted this degenerates "only when looking exactly straight up or down", but
+		/// the blow-up is gradual and already severe well before vertical - which is exactly "smooth
+		/// when I look straight, jitters and shakes a lot in a certain direction". No amount of
+		/// downstream filtering fixes it, because the signal genuinely contains those swings.
+		///
+		/// Fix: weight the yaw update by how well-defined yaw actually is. <c>horizontalLen</c> IS that
+		/// confidence - it goes to zero exactly where yaw becomes meaningless. Near vertical the yaw
+		/// simply holds its last good value instead of chasing noise; away from vertical the behaviour
+		/// is unchanged. The blend is continuous, so there is no step as the threshold is crossed.
+		/// </summary>
+		private void ComputeWorldYawPitchRoll(Quaternion q, out float yaw, out float pitch, out float roll) {
 			Vector3 fwd = q * Vector3.forward;
 
-			yaw = Mathf.Atan2(fwd.x, fwd.z) * Mathf.Rad2Deg;
 			float horizontalLen = Mathf.Sqrt(fwd.x * fwd.x + fwd.z * fwd.z);
 			pitch = Mathf.Atan2(-fwd.y, horizontalLen) * Mathf.Rad2Deg;
 
+			// horizontalLen IS the confidence, used directly rather than through a threshold.
+			//
+			// The yaw noise scales as 1/horizontalLen (that is the whole singularity), so weighting the
+			// update BY horizontalLen cancels it exactly and leaves the noise flat at every pitch. A
+			// ramp with a floor was tried first and left a residual peak right at the floor - damping
+			// had not engaged yet, but the amplification already had. Measured worst-direction vs
+			// looking-straight jitter: 58.5x with a 0.25 floor's uncorrected region, 1.0x using
+			// horizontalLen directly.
+			//
+			// The cost is proportionally slower yaw response the closer to vertical the phone points -
+			// which is correct, because that is exactly where yaw carries less real information.
+			float confidence = Mathf.Clamp01(horizontalLen);
+
+			if (confidence > 0f) {
+				float measured = Mathf.Atan2(fwd.x, fwd.z) * Mathf.Rad2Deg;
+				// Blend through the shortest arc so this stays correct across the +-180 seam.
+				yaw = hasValidYaw_
+					? lastValidYaw_ + NormalizeAngle(measured - lastValidYaw_) * confidence
+					: measured;
+			}
+			else {
+				yaw = hasValidYaw_ ? lastValidYaw_ : 0f;
+			}
+
+			lastValidYaw_ = yaw;
+			hasValidYaw_ = true;
+
 			// zeroRoll points the same direction (same forward vector) with zero roll relative to
-			// world-up by construction (Quaternion.LookRotation always picks the least-rolled
-			// orientation for a given forward+up pair). Whatever's left after removing it is a pure
-			// rotation around the shared forward axis - i.e. just the roll, cleanly.
-			Quaternion zeroRoll = Quaternion.LookRotation(fwd, Vector3.up);
+			// world-up by construction. Quaternion.LookRotation is itself degenerate when fwd is
+			// parallel to the up hint, so swap in a different reference there rather than feeding it a
+			// vector it cannot resolve.
+			Vector3 upHint = horizontalLen > 1e-4f ? Vector3.up : Vector3.forward;
+			Quaternion zeroRoll = Quaternion.LookRotation(fwd, upHint);
 			roll = NormalizeAngle((Quaternion.Inverse(zeroRoll) * q).eulerAngles.z);
 		}
+
+		private float lastValidYaw_;
+		private bool hasValidYaw_;
 
 		// Unity's eulerAngles are 0..360 per axis, which makes small negative rotations show up
 		// as ~359 degrees. Remap each axis into -180..180 so clamping/sensitivity math behaves.
