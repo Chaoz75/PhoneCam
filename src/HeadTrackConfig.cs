@@ -201,5 +201,17 @@ namespace HeadTrackARKit {
 		/// HeadTrackMod (MaxOrbitYawDegrees / MaxOrbitPitchDegrees).
 		/// </summary>
 		bool OrbitSensitivityRetuned { get; set; }
+
+		/// <summary>
+		/// One-time correction now that 0.5.0 made the pose write actually reach the screen.
+		///
+		/// Orbit mode and the inflated 2.5x position sensitivity were both compensation for a camera
+		/// that appeared not to move - and the real cause was the frame-ordering bug, not weak motion.
+		/// With the write landing before HDRP's snapshot, plain 1:1 tracking is visible on its own, and
+		/// those two amplifications now read as the camera sliding and swinging around instead of
+		/// sitting still and turning like a head. Resets orbit mode OFF and PositionSensitivity to a
+		/// true 1.0 exactly once. Both remain adjustable afterwards.
+		/// </summary>
+		bool PostFrameOrderRetune { get; set; }
 	}
 }

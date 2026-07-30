@@ -9,6 +9,32 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.5.1** - Camera now holds its position and turns, instead of sliding sideways.
+
+With 0.5.0 finally putting the pose write where HDRP reads it, two settings that existed purely to
+compensate for an apparently-frozen camera became actively harmful:
+
+- **Orbit mode** swung the camera bodily around the car (up to 4.4 m of lateral travel).
+- **`PositionSensitivity` at 2.5x** amplified real phone movement 2.5 times.
+
+Both were added while chasing "the camera doesn't move", when the actual cause was the frame-ordering
+bug. Reset once via `PostFrameOrderRetune`: **orbit off**, **`PositionSensitivity` 1.0**. Rotation is
+unchanged (still 1:1 with the phone) — only the sideways travel changes:
+
+| Phone motion | Old (orbit on, 2x) | New (orbit off, 1:1) |
+|---|---|---|
+| Small wrist turn | 1.31 m | **0.05 m** |
+| Normal look | 4.00 m | **0.10 m** |
+| Big look | 4.39 m | **0.15 m** |
+
+With orbit off the write is `t.position += t.rotation * posOffset; t.rotation = t.rotation * rotOffset;`
+— the camera pivots where it sits and only shifts by however far the phone physically moved. That is
+the head-tracking behaviour: look left and the *view* turns left, rather than the camera walking left.
+
+The settings toggle is relabelled to describe behaviour rather than implementation:
+**"Swing the camera around the car (off = stay in place and turn)"**. Orbit and its strength slider
+remain available for anyone who wants the sweeping-crane look.
+
 **0.5.0** - **THE root cause.** Every version of this mod up to 0.4.6 wrote the camera pose too late
 in the frame for HDRP to ever use it. Not a math bug, not a tracking bug — a frame-ordering bug.
 

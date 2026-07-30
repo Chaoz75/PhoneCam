@@ -22,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.5.0", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.5.1", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.5.0";
+		private const string CurrentVersion = "0.5.1";
 
 		private const int DefaultOscPort = 9000;
 
@@ -1785,6 +1785,17 @@ namespace HeadTrackARKit {
 				config_.OrbitModeDefaulted = true;
 			}
 
+			// 0.5.1: see IHeadTrackConfig.PostFrameOrderRetune. Orbit mode and the 2.5x position
+			// sensitivity were both compensation for a camera that appeared frozen - and the real cause
+			// turned out to be 0.5.0's frame-ordering bug, not weak motion. Now that the write actually
+			// reaches the screen, both of those read as the camera sliding sideways and swinging around
+			// the car instead of sitting still and turning like a head. Reset once to plain 1:1.
+			if (!config_.PostFrameOrderRetune) {
+				config_.OrbitModeEnabled = false;
+				config_.PositionSensitivity = 1.0f;
+				config_.PostFrameOrderRetune = true;
+			}
+
 			// See IHeadTrackConfig.OrbitSensitivity - 1:1 orbit is measurably too subtle to perceive, so
 			// this starts at 5x. One-time, so tuning the slider afterward sticks.
 			if (config_.OrbitSensitivity <= 0) config_.OrbitSensitivity = 2.0f;
@@ -1892,18 +1903,25 @@ namespace HeadTrackARKit {
 
 			// 0.4.2: see IHeadTrackConfig.OrbitModeEnabled. Left switchable because once positional
 			// tracking is working phone-side, straight 1:1 (orbit off) is the more faithful mode.
+			// 0.5.1: relabelled around what the two modes actually feel like, rather than the
+			// implementation term. Off (the default) is the head-tracking behaviour: the camera holds
+			// its position and turns, so looking left turns the view left instead of sliding the camera
+			// left. On swings the camera bodily around the car.
 			bool orbitMode = config_.OrbitModeEnabled;
-			if (Kino.UI.Toggle("Orbit around car (needed while phone sends rotation only)", ref orbitMode)) {
+			if (Kino.UI.Toggle("Swing the camera around the car (off = stay in place and turn)", ref orbitMode)) {
 				config_.OrbitModeEnabled = orbitMode;
 				Kino.Log.Info($"[HeadTrackARKit] Orbit mode toggled {(orbitMode ? "ON" : "OFF")}.");
 			}
 
 			if (orbitMode) {
 				float orbitSens = config_.OrbitSensitivity;
-				if (Kino.UI.Slider(ref orbitSens, 0.5f, 6f, $"Orbit strength: {orbitSens:F1}x")) {
+				if (Kino.UI.Slider(ref orbitSens, 0.5f, 6f, $"Swing strength: {orbitSens:F1}x")) {
 					config_.OrbitSensitivity = orbitSens;
 				}
-				Kino.UI.Label("Turn/tilt the phone to swing the camera around the car. Raise this if the movement is too subtle.");
+				Kino.UI.Label("Turning the phone walks the camera around the car. Lower this if it slides too far sideways.");
+			}
+			else {
+				Kino.UI.Label("Camera stays put and turns with the phone. 'Position sensitivity' below controls how far real phone movement shifts it.");
 			}
 
 			if (Kino.UI.Input(ref portText_, 5, "^[0-9]{1,5}$")) {
