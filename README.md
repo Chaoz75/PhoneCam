@@ -9,6 +9,61 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.6.0** - Adaptive anti-jitter filter, plus the teleport-into-the-car fix.
+
+### First, an admission about the measurements
+
+`appliedOffsetEuler` was logged with **`F0` — whole degrees**. `transformPos` / `transformFwd` used
+`F2`. So sub-degree rotational jitter, which is precisely the scale of visible camera shake, was
+quantised away entirely; in the last log **79% of consecutive `endOfRender` lines were byte-identical**.
+Every jitter measurement in this project has sat at or below that noise floor, including the "6.4%
+reversals, mean 2.57°" that motivated 0.5.5. Precision is now `F2` for angles and `F4` for vectors.
+
+### The real cause: the signal itself is noisy
+
+0.5.4 and 0.5.5 fixed how the offset was *coupled* to the camera's frame — both were genuine bugs — but
+decoupling a noisy signal perfectly still delivers the noise. ARKit carries a few tenths of a degree of
+high-frequency noise, and the saved `RotationSmoothing` of 0.83 closes ~48% of the error every frame,
+i.e. is **effectively unfiltered**. Parked, that noise is nearly invisible against a static scene.
+Driving, the same noise swings the entire world across the screen — which is why it only showed when
+moving.
+
+A fixed-strength low-pass cannot solve this: strong enough to kill the noise means deliberate movement
+lags badly. The **1-euro filter** resolves the trade-off by varying its cutoff with the signal's own
+speed — heavy smoothing at rest, opening up as you actually move. It is the standard solution for noisy
+6DOF pose streams.
+
+```
+cutoff = MinCutoffHz + SpeedCoefficient * speed
+tau    = 1 / (2*pi*cutoff)
+alpha  = dt / (tau + dt)
+```
+
+On by default (`Adaptive anti-jitter filter`), with **Steadiness at rest** and **Responsiveness**
+sliders.
+
+### Verification (`tools/adaptive_filter_proof.py`)
+
+Simulated ARKit stream with 0.25° per-sample noise at 144 fps, over a still → 40° look → still profile:
+
+| | Resting jitter (mean/frame) | Lag during a deliberate 40° look |
+|---|---|---|
+| Fixed low-pass (0.83) | 0.1169° | 0.71° |
+| **Adaptive 1-euro** | **0.0153°** (**8× less**) | 1.64° |
+
+And the trade-off a fixed filter cannot escape: to match that steadiness it needs `smoothing = 0.035`,
+which costs **18.9°** of lag — **12× worse** than the adaptive filter's 1.64°.
+
+### Teleporting back into the car
+
+0.4.5 correctly stopped applying a frozen stale pose, but did it with an instant `return` — the offset
+dropped from full to zero in one frame, snapping the camera to CarX's own pose (at/inside the car) and
+snapping back out when packets resumed. The last log contains two `OSC signal lost` / `restored` pairs,
+so this was firing for real. The offset now **fades** out and back in over 0.35 s via
+`signalConfidence_`. Stale still contributes nothing; it just gets there smoothly.
+
+8/8 harnesses pass.
+
 **0.5.5** - The remaining shake: the **rotation** was still applied in the camera's own tilting frame.
 0.5.4 fixed this for translation and left it in place for rotation.
 

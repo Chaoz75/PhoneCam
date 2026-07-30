@@ -22,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.5.5", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.6.0", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.5.5";
+		private const string CurrentVersion = "0.6.0";
 
 		private const int DefaultOscPort = 9000;
 
@@ -99,6 +99,11 @@ namespace HeadTrackARKit {
 		// run on the transition out of that state instead of every single frame - see
 		// ResetCameraOverrideIfApplied.
 		private bool cameraOverrideApplied_;
+
+		// 0.6.0: 0..1 ramp used to fade the tracked offset out on signal loss and back in on recovery,
+		// instead of snapping it off in a single frame. See the fade block in ApplyTrackingToCamera.
+		private float signalConfidence_;
+		private const float SignalFadeSeconds = 0.35f;
 
 		// 0.4.6: bounds on the orbit arc - see the clamp in OnCameraPreCull for the measured reason.
 		// Yaw gets a usable arc; pitch stays small because pitch is what swings the camera under the car.
@@ -652,11 +657,11 @@ namespace HeadTrackARKit {
 		}
 
 		private static string FormatEuler(Vector3 e) {
-			return $"(x={e.x:F0},y={e.y:F0},z={e.z:F0})";
+			return $"(x={e.x:F2},y={e.y:F2},z={e.z:F2})";
 		}
 
 		private static string FormatVector(Vector3 v) {
-			return $"(x={v.x:F2},y={v.y:F2},z={v.z:F2})";
+			return $"(x={v.x:F4},y={v.y:F4},z={v.z:F4})";
 		}
 
 		/// <summary>
@@ -917,14 +922,33 @@ namespace HeadTrackARKit {
 			bool signalStale = receiver_.LastMessageTick == 0 ||
 			                   (Environment.TickCount - receiver_.LastMessageTick) > OscSignalLostThresholdMs;
 
-			if (state_.IsCalibrated && signalStale) {
+			// 0.6.0 - FIXES THE TELEPORT IN/OUT OF THE CAR.
+			//
+			// 0.4.5 correctly stopped applying a frozen stale pose, but it did so with an instant
+			// `return`: the offset went from full to zero in a single frame, so the camera snapped back
+			// to CarX's own pose - which is at/inside the car - and snapped back out the moment packets
+			// resumed. Real logs show this happening (two "OSC signal lost" / "restored" pairs in one
+			// session), and it is exactly the reported "sometimes it teleports back to the car seat,
+			// then goes back to where I was outside".
+			//
+			// The offset is now faded out and back in over SignalFadeSeconds instead. Stale still means
+			// the mod contributes nothing - it just gets there smoothly rather than in one frame.
+			float fadeStep = Time.unscaledDeltaTime / Mathf.Max(0.01f, SignalFadeSeconds);
+			signalConfidence_ = Mathf.Clamp01(signalConfidence_ + (signalStale ? -fadeStep : fadeStep));
+
+			if (state_.IsCalibrated && signalConfidence_ <= 0f) {
 				ResetCameraOverrideIfApplied(cam);
 				return;
 			}
 
 			if (state_.IsCalibrated) {
-				Vector3 posOffset = ApplyPositionInvert(state_.GetPositionOffset());
-				Quaternion rotOffset = FixLookDirection(state_.GetRotationOffsetEuler());
+				// 0.6.0: scaled by signalConfidence_ so a dropout fades the effect out instead of
+				// snapping it off - see the fade block above.
+				Vector3 posOffset = ApplyPositionInvert(state_.GetPositionOffset()) * signalConfidence_;
+				Quaternion rotOffset = Quaternion.Slerp(
+					Quaternion.identity,
+					FixLookDirection(state_.GetRotationOffsetEuler()),
+					signalConfidence_);
 
 				Transform t = cam.transform;
 
@@ -1913,6 +1937,13 @@ namespace HeadTrackARKit {
 			state_.RotationSmoothing = config_.RotationSmoothing;
 			state_.MaxPositionOffset = config_.MaxPositionOffset;
 			state_.MaxRotationOffsetDegrees = config_.MaxRotationOffset;
+			state_.AdaptiveFilterEnabled = config_.AdaptiveFilterEnabled;
+			state_.RotationMinCutoffHz = config_.FilterMinCutoffHz;
+			state_.RotationSpeedCoefficient = config_.FilterSpeedCoefficient;
+			state_.PositionMinCutoffHz = config_.FilterMinCutoffHz;
+			// Position speed is in m/s (small numbers) vs rotation's deg/s (large), so the position
+			// coefficient needs to be far larger to open the filter up over a comparable motion range.
+			state_.PositionSpeedCoefficient = config_.FilterSpeedCoefficient * 100f;
 		}
 
 		private void ApplyDefaultsIfUnset() {
@@ -2018,6 +2049,13 @@ namespace HeadTrackARKit {
 			// reaches the screen, both of those read as the camera sliding sideways and swinging around
 			// the car instead of sitting still and turning like a head. Reset once to plain 1:1.
 			// 0.5.4: reported backwards - moving the phone left slid the camera right.
+			if (!config_.AdaptiveFilterDefaulted) {
+				config_.AdaptiveFilterEnabled = true;
+				config_.AdaptiveFilterDefaulted = true;
+			}
+			if (config_.FilterMinCutoffHz <= 0) config_.FilterMinCutoffHz = 1.0f;
+			if (config_.FilterSpeedCoefficient <= 0) config_.FilterSpeedCoefficient = 0.02f;
+
 			if (!config_.PositionInvertDefaulted) {
 				config_.InvertPositionX = true;
 				config_.PositionInvertDefaulted = true;
@@ -2212,6 +2250,24 @@ namespace HeadTrackARKit {
 			Kino.UI.HorizontalLine();
 			Kino.UI.GroupLabel("Look direction");
 			Kino.UI.Label("If up/down or left/right ever feels backwards or reversed, flip it here.");
+
+			Kino.UI.GroupLabel("Jitter filter");
+			bool adaptive = config_.AdaptiveFilterEnabled;
+			if (Kino.UI.Toggle("Adaptive anti-jitter filter (recommended)", ref adaptive)) {
+				config_.AdaptiveFilterEnabled = adaptive;
+				SyncStateFromConfig();
+			}
+			if (adaptive) {
+				float mc = config_.FilterMinCutoffHz;
+				if (Kino.UI.Slider(ref mc, 0.2f, 6f, $"Steadiness at rest: {mc:F1} Hz (lower = steadier)")) {
+					config_.FilterMinCutoffHz = mc; SyncStateFromConfig();
+				}
+				float sc = config_.FilterSpeedCoefficient;
+				if (Kino.UI.Slider(ref sc, 0.002f, 0.2f, $"Responsiveness: {sc:F3}")) {
+					config_.FilterSpeedCoefficient = sc; SyncStateFromConfig();
+				}
+				Kino.UI.Label("Heavily smooths the phone's resting noise, then opens up as you actually move.");
+			}
 
 			Kino.UI.GroupLabel("Movement direction");
 			bool invPosX = config_.InvertPositionX;

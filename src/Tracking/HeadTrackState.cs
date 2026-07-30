@@ -11,8 +11,29 @@ namespace HeadTrackARKit.Tracking {
 		/// <summary>Position smoothing factor per frame, 0..1. Higher = snappier, lower = smoother/laggier.</summary>
 		public float PositionSmoothing = 0.35f;
 
-		/// <summary>Rotation smoothing factor per frame, 0..1.</summary>
+		/// <summary>Rotation smoothing factor per frame, 0..1. Only used when the adaptive filter is off.</summary>
 		public float RotationSmoothing = 0.45f;
+
+		/// <summary>Use the adaptive (1-euro) filter instead of the fixed-strength low-pass.</summary>
+		public bool AdaptiveFilterEnabled = true;
+
+		/// <summary>
+		/// Cutoff in Hz when the phone is essentially still. Lower = steadier at rest. 1 Hz gives very
+		/// heavy smoothing of ARKit's resting noise while remaining well above any real head movement.
+		/// </summary>
+		public float RotationMinCutoffHz = 1.0f;
+
+		/// <summary>
+		/// How fast the cutoff opens up with angular speed (per deg/s). Higher = more responsive to
+		/// deliberate movement, less noise rejection during it (noise matters far less while moving).
+		/// </summary>
+		public float RotationSpeedCoefficient = 0.02f;
+
+		/// <summary>Cutoff in Hz for position when essentially still.</summary>
+		public float PositionMinCutoffHz = 1.0f;
+
+		/// <summary>How fast the position cutoff opens up with linear speed (per m/s).</summary>
+		public float PositionSpeedCoefficient = 2.0f;
 
 		/// <summary>Multiplies the calibrated position delta before it's applied to the camera (meters -> meters).</summary>
 		public float PositionSensitivity = 1.0f;
@@ -87,11 +108,57 @@ namespace HeadTrackARKit.Tracking {
 			if (!hasRawSample_ || !hasSmoothedSample_) return;
 			if (deltaTime <= 0f) return;
 
+			if (AdaptiveFilterEnabled) {
+				UpdateAdaptiveSmoothing(deltaTime);
+				return;
+			}
+
 			float posRate = 1f - Mathf.Pow(1f - Mathf.Clamp01(PositionSmoothing), deltaTime * 60f);
 			float rotRate = 1f - Mathf.Pow(1f - Mathf.Clamp01(RotationSmoothing), deltaTime * 60f);
 
 			smoothedPosition_ = Vector3.Lerp(smoothedPosition_, rawPosition_, posRate);
 			smoothedRotation_ = Quaternion.Slerp(smoothedRotation_, rawRotation_, rotRate);
+		}
+
+		/// <summary>
+		/// 0.6.0 - adaptive (1-euro style) filtering. This is the fix for the driving shake.
+		///
+		/// A fixed-strength low-pass cannot solve tracker jitter: set it strong enough to kill the
+		/// noise and deliberate head movement lags badly; set it weak enough to feel responsive - which
+		/// is where this mod's saved values sat (RotationSmoothing 0.83 closes ~48% of the error every
+		/// frame, i.e. effectively unfiltered) - and ARKit's high-frequency noise goes straight to the
+		/// camera. Parked, a few tenths of a degree of that noise is nearly invisible against a static
+		/// scene. Driving, the same few tenths swing the whole world across the screen, which is why
+		/// the shake appeared only while moving.
+		///
+		/// The 1-euro filter resolves that trade-off by making the cutoff frequency track the signal's
+		/// own speed: nearly still -> very low cutoff -> heavy smoothing -> rock steady; moving fast ->
+		/// high cutoff -> light smoothing -> no perceptible lag. It is the standard solution for
+		/// exactly this problem (noisy 6DOF pose streams) and needs no per-user tuning.
+		///
+		///   cutoff = MinCutoffHz + SpeedCoefficient * speed
+		///   tau    = 1 / (2*pi*cutoff)
+		///   alpha  = dt / (tau + dt)
+		///
+		/// Speed is measured against the previous SMOOTHED value, so the filter reacts to real motion
+		/// rather than to noise spikes.
+		/// </summary>
+		private void UpdateAdaptiveSmoothing(float deltaTime) {
+			// --- rotation ---
+			float angleDelta = Quaternion.Angle(smoothedRotation_, rawRotation_);
+			float angularSpeed = angleDelta / deltaTime;                      // deg/s
+			float rotCutoff = RotationMinCutoffHz + RotationSpeedCoefficient * angularSpeed;
+			smoothedRotation_ = Quaternion.Slerp(smoothedRotation_, rawRotation_, Alpha(rotCutoff, deltaTime));
+
+			// --- position ---
+			float linearSpeed = (rawPosition_ - smoothedPosition_).magnitude / deltaTime;  // m/s
+			float posCutoff = PositionMinCutoffHz + PositionSpeedCoefficient * linearSpeed;
+			smoothedPosition_ = Vector3.Lerp(smoothedPosition_, rawPosition_, Alpha(posCutoff, deltaTime));
+		}
+
+		private static float Alpha(float cutoffHz, float deltaTime) {
+			float tau = 1f / (2f * Mathf.PI * Mathf.Max(0.0001f, cutoffHz));
+			return Mathf.Clamp01(deltaTime / (tau + deltaTime));
 		}
 
 		/// <summary>Set the current smoothed pose as the "looking at the screen normally" baseline.</summary>

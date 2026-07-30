@@ -150,6 +150,25 @@ namespace HeadTrackARKit {
 		/// </summary>
 		bool PositionInvertDefaulted { get; set; }
 
+		// --- Adaptive jitter filter (0.6.0) ---
+
+		/// <summary>
+		/// Use the adaptive (1-euro) filter rather than a fixed-strength low-pass. A fixed filter
+		/// cannot both reject ARKit's resting noise and stay responsive; this one varies its cutoff
+		/// with the signal's own speed, so it is heavily smoothed when the phone is still and
+		/// responsive when it is deliberately moved. On by default.
+		/// </summary>
+		bool AdaptiveFilterEnabled { get; set; }
+
+		/// <summary>Steadiness at rest, in Hz. Lower = steadier, slightly softer onset of movement.</summary>
+		float FilterMinCutoffHz { get; set; }
+
+		/// <summary>How quickly the filter opens up as the phone moves. Higher = snappier.</summary>
+		float FilterSpeedCoefficient { get; set; }
+
+		/// <summary>One-time migration turning the adaptive filter on for existing installs.</summary>
+		bool AdaptiveFilterDefaulted { get; set; }
+
 		// --- Privacy ---
 
 		/// <summary>
