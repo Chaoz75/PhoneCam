@@ -9,6 +9,97 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.4.4** - Fixes the regression introduced in 0.4.0. The camera was frozen *because of* that change,
+not despite it.
+
+### The regression, exactly
+
+`git diff bb1eb57 287af3f` on the camera write:
+
+```diff
+-  t.position += t.rotation * posOffset;        // 0.3.31 - ADD to CarX's live camera
+-  t.rotation  = t.rotation * rotOffset;
++  Vector3    basePosition = car.TransformPoint(anchorLocalPosition_);   // 0.4.0
++  Quaternion baseRotation = car.rotation * anchorLocalRotation_;
++  t.position = basePosition + baseRotation * posOffset;                 // ASSIGN
++  t.rotation = baseRotation * rotOffset;
+```
+
+`+=` became `=`. `basePosition` and `baseRotation` are both **constant in the car's frame**, so
+assigning them welded the camera rigidly to the car and discarded everything CarX's own camera
+produces - the sway, the follow lag, the velocity offset, the damping (`m_CurrentVelocityOffset`,
+`m_FollowSpeed`, `m_FollowTime`, `m_SwaySpeed` on `CarX.FollowCamera`). And because the phone's tracked
+delta sits at or near zero most of the time - real logs show `appliedOffsetEuler=(0,0,0)` and `(0,0,1)`
+for long stretches - the camera then held a pixel-perfect fixed pose relative to the car while the world
+and other vehicles streamed past.
+
+That is the reported symptom, and it was **strictly worse** than what it replaced: 0.3.31 and earlier at
+least inherited all of CarX's camera movement, so the camera never looked dead.
+
+### The fix
+
+Additive again, as in 0.3.31: CarX's solve is kept and only perturbed. The orbit contribution is applied
+as a **displacement relative to the calibrated seat**, which is identically zero at the phone's neutral
+pose, plus an aim *correction* (`Quaternion.FromToRotation(oldAim, newAim)`) rather than an aim
+replacement. At neutral the whole thing is a mathematical no-op, so it is now structurally impossible
+for this code to freeze the camera.
+
+### Verification (`tools/regression_proof.py`)
+
+Both versions modelled against a moving CarX chase cam over 12 simulated seconds. The chase cam model
+includes positional lag, which matters - with a rigid boom the camera's car-relative motion is zero by
+construction and the test cannot tell "welded to the car" apart from "normal".
+
+| Metric (phone at neutral) | CarX alone | 0.4.0-0.4.3 | 0.4.4 |
+|---|---|---|---|
+| World travel over 12 s | 71.42 m | 71.26 m | 71.42 m |
+| **Travel relative to the car** (what you see) | **5.319 m** | **0.000 m — FROZEN** | **5.319 m** |
+| Deviation from CarX's camera at neutral | - | - | **0.00e+00 m** |
+
+With a real logged phone sample (pitch -7, yaw +4, gain 5x) 0.4.4 still displaces the camera **3.24 m**.
+3/3 checks pass; the 9 earlier geometry checks in `tools/rig_validation.py` still pass.
+
+**0.4.3** - Adds a dedicated orbit gain. The pipeline was working; the output was too small to see.
+
+### What the 0.4.2 log actually showed
+
+Orbit mode was active (`cameraMode=rig(car-anchored)`, `orbitMode=True`, `car=MazdaRX7`) and the camera
+**was** moving - 56 distinct positions across 286 rendered frames, roughly 0.6 m of travel. Not frozen.
+
+The problem is magnitude. Measured over 108 samples:
+
+| Quantity | Measured |
+|---|---|
+| `appliedOffsetEuler` yaw, typical | **5-10 deg** (one outlier at 48) |
+| `appliedOffsetEuler` pitch, range | 28 deg |
+| raw `incomingPos` range | ~0.1 m per axis |
+| resulting camera travel | **~0.6 m** |
+
+With the real logged anchor (car-local `(0.39, 2.53, -3.96)`, boom 4.72 m), an 8 degree wrist turn at
+1:1 moves the camera **0.62 m**. On a 4.7 m chase boom that is indistinguishable from the chase
+camera's own sway - which is exactly why it reads as "not moving."
+
+One correction to 0.4.2's writeup: the "357 deg of yaw range" cited there was an artifact. Raw yaw sits
+at approximately +/-179 and jitters across the wrap seam, so a naive min/max reports ~357 deg for a
+phone that is barely turning. The meaningful figure is the wrap-corrected delta from calibration, which
+is the 5-10 deg above. Positional tracking also now reads `positionalTrackingLooksDead=False`
+(0.272 m spread), so it is weak rather than absent.
+
+### The change
+
+Orbit is an angular lever, not a 1:1 mapping, so it now has its own gain (`OrbitSensitivity`,
+default **5x**, slider 1-15x) independent of `RotationSensitivity`:
+
+| Phone yaw | Gain | Orbit | Camera travel |
+|---|---|---|---|
+| 8 deg | 1x | 8 deg | 0.62 m |
+| 8 deg | **5x** | **40 deg** | **3.03 m** |
+| 10 deg | 5x | 50 deg | 3.75 m |
+
+The heartbeat now logs `orbitEuler`, `orbitSensitivity` and `cameraTravelFromSeat=Xm`, so the magnitude
+reaching the screen is a number in the log rather than a judgement call. If `cameraTravelFromSeat` reads
+several metres and the screen still looks static, the fault is downstream of the pose write.
+
 **0.4.1** - Root-cause investigation of "the camera still doesn't move" on 0.4.0, plus the two
 defects that investigation exposed. **No changes to the camera pipeline.**
 

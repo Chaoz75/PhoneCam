@@ -174,5 +174,22 @@ namespace HeadTrackARKit {
 
 		/// <summary>One-time migration so <see cref="OrbitModeEnabled"/> defaults on, not off.</summary>
 		bool OrbitModeDefaulted { get; set; }
+
+		/// <summary>
+		/// Multiplier applied to the phone's rotation *specifically when driving orbit mode*, separate
+		/// from <see cref="RotationSensitivity"/>.
+		///
+		/// Measured from the 0.4.2 session: the phone's rotation delta from the calibration point is
+		/// typically only 5-10 degrees (108 samples; a single outlier reached 48). At 1:1 on a ~4.7 m
+		/// chase boom, 8 degrees of orbit moves the camera about 0.65 m - real, and confirmed present in
+		/// the log (56 distinct camera positions over 286 frames), but small enough to be indistinguishable
+		/// from the chase camera's own sway. Orbit is an angular lever rather than a 1:1 mapping, so it
+		/// wants its own gain: at 5x, that same 8 degree wrist turn swings the camera roughly 40 degrees
+		/// around the car (about 3.2 m of travel), which is unmistakable.
+		/// </summary>
+		float OrbitSensitivity { get; set; }
+
+		/// <summary>One-time migration so <see cref="OrbitSensitivity"/> starts at a usable 5x.</summary>
+		bool OrbitSensitivityDefaulted { get; set; }
 	}
 }

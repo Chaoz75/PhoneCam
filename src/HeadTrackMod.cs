@@ -22,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.4.2", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.4.4", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.4.2";
+		private const string CurrentVersion = "0.4.4";
 
 		private const int DefaultOscPort = 9000;
 
@@ -69,6 +69,11 @@ namespace HeadTrackARKit {
 		private Vector3 positionRangeMax_;
 		private bool positionRangeSeeded_;
 		private const float PositionalTrackingDeadThresholdM = 0.25f;
+
+		// 0.4.3: the orbit angle actually applied, and how far it moves the camera in metres. Logged so
+		// "is the camera moving enough to see" is a number in the log rather than a judgement call.
+		private Vector3 lastOrbitEuler_;
+		private float lastOrbitTravel_;
 
 		// 0.3.17: see the comment at the write site in OnCameraPreCull - ground-truth camera
 		// world position after this mod's own Transform write, for isolating whether an offset
@@ -697,64 +702,76 @@ namespace HeadTrackARKit {
 				// replaces the old additive write. Both branches below produce a final pose; the rig
 				// branch builds it outright from the car, the fallback keeps the historical additive
 				// behaviour for when there's no car to anchor to.
-				Transform car = hasCarAnchor_ ? GetCarTransform() : null;
+				Transform car = (hasCarAnchor_ && config_.OrbitModeEnabled) ? GetCarTransform() : null;
 
+				// 0.4.4 - REGRESSION FIX.
+				//
+				// 0.4.0 through 0.4.3 ASSIGNED the camera pose here instead of adding to it:
+				//
+				//     basePosition = car.TransformPoint(anchorLocalPosition_);
+				//     baseRotation = car.rotation * anchorLocalRotation_;
+				//     t.position   = basePosition + baseRotation * posOffset;
+				//     t.rotation   = baseRotation * rotOffset;
+				//
+				// Both of those base values are CONSTANT in the car's frame, so assigning them welded
+				// the camera rigidly to the car: no chase-cam sway, no follow lag, no velocity offset,
+				// no damping - every bit of motion CarX's own camera produces was thrown away and
+				// replaced with a fixed seat. And because the phone's tracked delta sits at or near
+				// zero most of the time (real logs show appliedOffsetEuler of (0,0,0) and (0,0,1) for
+				// long stretches), the camera then held a pixel-perfect fixed pose relative to the car
+				// while the world and other vehicles streamed past. That is precisely the reported
+				// symptom, and it was strictly WORSE than the behaviour it replaced - 0.3.31 and
+				// earlier at least inherited all of CarX's own camera movement.
+				//
+				// Everything below is additive again, exactly like 0.3.31: whatever CarX's Cinemachine
+				// solve wrote this frame is kept and only perturbed. The orbit contribution is applied
+				// as a DISPLACEMENT relative to the calibrated seat, which is identically zero when the
+				// phone is at its neutral pose - so at worst this mod is a no-op and the camera behaves
+				// exactly as the game intends. It is now structurally impossible for this code to
+				// freeze the camera.
 				if (car != null) {
-					// Where the camera should sit this frame, ignoring tracking: the calibration-time
-					// pose, carried along by the car's CURRENT transform. This is what makes the rig
-					// follow the car without ever reading (and therefore without ever fighting) what
-					// CarX's own Cinemachine solve just wrote.
-					Vector3 basePosition = car.TransformPoint(anchorLocalPosition_);
-					Quaternion baseRotation = car.rotation * anchorLocalRotation_;
+					Vector3 pivotLocal = OrbitPivotLocal();
+					Vector3 boomLocal = anchorLocalPosition_ - pivotLocal;
 
-					if (config_.OrbitModeEnabled) {
-						// 0.4.2 - ORBIT MODE. See IHeadTrackConfig.OrbitModeEnabled for the measured
-						// justification: the phone's positional stream is dead (9 cm of range across a
-						// whole session) while its attitude stream is fully alive (359 degrees). With
-						// translation unusable, rotating the camera in place is geometrically incapable
-						// of moving it anywhere - so instead, the phone's yaw/pitch swings the camera
-						// AROUND the car on the boom length it was calibrated at, and the camera keeps
-						// looking at what it was framing. Turning the phone left now walks the camera
-						// left around the car, which is real, visible camera travel driven entirely by
-						// the one signal that works.
-						Vector3 pivotLocal = OrbitPivotLocal();
-						Vector3 boomLocal = anchorLocalPosition_ - pivotLocal;
+					// Orbit gets its own gain (0.4.3) because the measured rotation delta is only 5-10
+					// degrees in normal use; at 1:1 on a ~4.7 m boom that is under a metre of travel.
+					float orbitGain = Mathf.Max(0.1f, config_.OrbitSensitivity);
+					Vector3 offsetEuler = lastAppliedOffsetEuler_ * orbitGain;
+					Quaternion orbit = Quaternion.AngleAxis(offsetEuler.y, Vector3.up) *
+					                   Quaternion.AngleAxis(offsetEuler.x, Vector3.right);
 
-						// Yaw about the car's up axis, pitch about its right axis. Built from the same
-						// offset euler the normal path uses, so sensitivity/smoothing/inversion all
-						// still apply identically.
-						Vector3 offsetEuler = lastAppliedOffsetEuler_;
-						Quaternion orbit = Quaternion.AngleAxis(offsetEuler.y, Vector3.up) *
-						                   Quaternion.AngleAxis(offsetEuler.x, Vector3.right);
+					// The displacement the orbit implies, in the car's local frame. Zero when the phone
+					// is neutral (orbit == identity => orbitedLocal == anchorLocalPosition_), which is
+					// what guarantees this can never subtract CarX's own motion.
+					Vector3 orbitedLocal = pivotLocal + orbit * boomLocal;
+					Vector3 orbitDeltaLocal = orbitedLocal - anchorLocalPosition_;
+					Vector3 orbitDeltaWorld = car.rotation * orbitDeltaLocal;
 
-						Vector3 orbitedLocal = pivotLocal + orbit * boomLocal;
-
-						// Translation, when it eventually works, still applies on top - so this needs
-						// no second code path once positional tracking is fixed phone-side.
-						Vector3 orbitedWorld = car.TransformPoint(orbitedLocal);
-						Vector3 pivotWorld = car.TransformPoint(pivotLocal);
-
-						Vector3 aim = pivotWorld - orbitedWorld;
-						Quaternion orbitRotation = aim.sqrMagnitude > 1e-8f
-							? Quaternion.LookRotation(aim, car.up)
-							: baseRotation;
-
-						basePosition = orbitedWorld;
-						baseRotation = orbitRotation * Quaternion.AngleAxis(offsetEuler.z, Vector3.forward);
-						rotOffset = Quaternion.identity; // the orbit already consumed the rotation
-					}
+					lastOrbitEuler_ = offsetEuler;
+					lastOrbitTravel_ = orbitDeltaLocal.magnitude;
 
 					if (config_.ClippingGuardEnabled && posOffset.sqrMagnitude > 1e-6f) {
-						posOffset = ApplyClippingGuard(basePosition, baseRotation, posOffset);
+						posOffset = ApplyClippingGuard(t.position, t.rotation, posOffset);
 					}
 
 					lastAppliedPosOffset_ = posOffset;
 
-					// Translation is expressed in the anchor's own frame, so "lean left" is always
-					// left relative to how the camera was aimed at calibration - not relative to
-					// whatever direction the camera happens to have swung to since.
-					t.position = basePosition + baseRotation * posOffset;
-					t.rotation = baseRotation * rotOffset;
+					Vector3 originalPosition = t.position;
+					Vector3 newPosition = originalPosition + orbitDeltaWorld + t.rotation * posOffset;
+
+					// Swing the aim to match the new vantage point, as a CORRECTION on top of CarX's own
+					// aim rather than a replacement for it: the rotation that takes the old view
+					// direction of the framed point to the new one. Identity when orbitDeltaWorld is
+					// zero, so CarX's aiming and sway survive untouched at neutral.
+					Vector3 pivotWorld = car.TransformPoint(pivotLocal);
+					Vector3 oldAim = pivotWorld - originalPosition;
+					Vector3 newAim = pivotWorld - newPosition;
+					Quaternion aimCorrection = (oldAim.sqrMagnitude > 1e-8f && newAim.sqrMagnitude > 1e-8f)
+						? Quaternion.FromToRotation(oldAim, newAim)
+						: Quaternion.identity;
+
+					t.position = newPosition;
+					t.rotation = aimCorrection * t.rotation * rotOffset;
 				}
 				else {
 					if (config_.ClippingGuardEnabled && posOffset.sqrMagnitude > 1e-6f) {
@@ -1023,6 +1040,17 @@ namespace HeadTrackARKit {
 					$"[HeadTrackARKit][diag] cameraMode={(diagCar != null ? "rig(car-anchored)" : "additive-fallback")} " +
 					$"hasCarAnchor={hasCarAnchor_} car={(diagCar != null ? diagCar.name : "(none)")} " +
 					$"anchorLocalPos={FormatVector(anchorLocalPosition_)}");
+
+				// 0.4.3: the decisive magnitude line. cameraTravel is how far, in metres, orbit has moved
+				// the camera from its calibrated seat. Under ~0.5 m is easy to mistake for the chase cam's
+				// own sway; a few metres is unmistakable. If this number is large and the screen still
+				// looks static, the problem is downstream of the pose write, not in the tracking.
+				if (config_.OrbitModeEnabled) {
+					Kino.Log.Info(
+						$"[HeadTrackARKit][diag] orbitEuler={FormatEuler(lastOrbitEuler_)} " +
+						$"orbitSensitivity={config_.OrbitSensitivity:F2} " +
+						$"cameraTravelFromSeat={lastOrbitTravel_:F2}m");
+				}
 
 				// 0.4.1: state the two hard preconditions outright, every heartbeat. Working out that
 				// a whole session had Enabled=false previously required noticing which log lines were
@@ -1606,6 +1634,14 @@ namespace HeadTrackARKit {
 				config_.OrbitModeDefaulted = true;
 			}
 
+			// See IHeadTrackConfig.OrbitSensitivity - 1:1 orbit is measurably too subtle to perceive, so
+			// this starts at 5x. One-time, so tuning the slider afterward sticks.
+			if (config_.OrbitSensitivity <= 0) config_.OrbitSensitivity = 5.0f;
+			if (!config_.OrbitSensitivityDefaulted) {
+				config_.OrbitSensitivity = 5.0f;
+				config_.OrbitSensitivityDefaulted = true;
+			}
+
 			if (!config_.StatusHudDefaulted) {
 				config_.ShowStatusHud = true;
 				config_.StatusHudDefaulted = true;
@@ -1702,6 +1738,14 @@ namespace HeadTrackARKit {
 			if (Kino.UI.Toggle("Orbit around car (needed while phone sends rotation only)", ref orbitMode)) {
 				config_.OrbitModeEnabled = orbitMode;
 				Kino.Log.Info($"[HeadTrackARKit] Orbit mode toggled {(orbitMode ? "ON" : "OFF")}.");
+			}
+
+			if (orbitMode) {
+				float orbitSens = config_.OrbitSensitivity;
+				if (Kino.UI.Slider(ref orbitSens, 1f, 15f, $"Orbit strength: {orbitSens:F1}x")) {
+					config_.OrbitSensitivity = orbitSens;
+				}
+				Kino.UI.Label("Turn/tilt the phone to swing the camera around the car. Raise this if the movement is too subtle.");
 			}
 
 			if (Kino.UI.Input(ref portText_, 5, "^[0-9]{1,5}$")) {
