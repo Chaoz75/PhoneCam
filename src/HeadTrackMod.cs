@@ -22,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.5.4", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.5.5", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.5.4";
+		private const string CurrentVersion = "0.5.5";
 
 		private const int DefaultOscPort = 9000;
 
@@ -1035,7 +1035,13 @@ namespace HeadTrackARKit {
 						: Quaternion.identity;
 
 					t.position = newPosition;
-					t.rotation = aimCorrection * t.rotation * rotOffset;
+
+					// 0.5.5: same stable-axis treatment as the non-orbit path - `* rotOffset` on the end
+					// would apply the phone delta about the camera's own tilting axes and reintroduce the
+					// sway-coupled wobble here. aimCorrection stays a world-space pre-multiply.
+					Quaternion orbitStable = GetStableOffsetFrame(t);
+					Quaternion orbitStableDelta = orbitStable * rotOffset * Quaternion.Inverse(orbitStable);
+					t.rotation = orbitStableDelta * aimCorrection * t.rotation;
 				}
 				else {
 					// 0.5.4 - FIXES THE DRIVING/DRIFTING SHAKE.
@@ -1064,7 +1070,31 @@ namespace HeadTrackARKit {
 					lastAppliedPosOffset_ = posOffset;
 
 					t.position += offsetFrame * posOffset;
-					t.rotation = t.rotation * rotOffset;
+
+					// 0.5.5 - THE REMAINING SHAKE. Same bug as the translation frame (0.5.4), left in
+					// place for rotation.
+					//
+					// This was `t.rotation = t.rotation * rotOffset` - a POST-multiply, which applies the
+					// phone's delta about the CAMERA'S OWN axes. While driving those axes are constantly
+					// tilting: CarX.FollowCamera pitches and rolls the camera (sway) and yaws it hard to
+					// follow a drift. So a CONSTANT phone offset produced a CHANGING world-space
+					// rotation - the aim wobbled even with the phone perfectly still, and the wobble
+					// tracked the sway. Parked, the axes are steady and the same offset is rock solid,
+					// which is exactly the reported "jitters whenever the car moves".
+					//
+					// Measured in tools/rotation_frame_proof.py: 1.89 degrees of oscillating aim error
+					// while driving, 0.0000 with the fix. That is the right order of magnitude for the
+					// real thing - a live 0.5.4 driving capture showed rotation-direction reversals
+					// averaging 2.57 degrees and peaking at 6.38.
+					//
+					// Applying it as a similarity transform in the stable frame
+					// (s * rotOffset * inverse(s), pre-multiplied) rotates the camera about the CAR's
+					// heading and world up instead: phone yaw always yaws about world up, phone pitch
+					// always pitches about the car's right axis, regardless of how the camera is rolling
+					// or swinging. The contribution is then constant for a constant phone pose, which is
+					// the property that removes the shake.
+					Quaternion stableDelta = offsetFrame * rotOffset * Quaternion.Inverse(offsetFrame);
+					t.rotation = stableDelta * t.rotation;
 				}
 
 				// 0.3.17: ground-truth check for the "stepping left does nothing" report - logs

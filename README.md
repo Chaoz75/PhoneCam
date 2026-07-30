@@ -9,6 +9,63 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.5.5** - The remaining shake: the **rotation** was still applied in the camera's own tilting frame.
+0.5.4 fixed this for translation and left it in place for rotation.
+
+### Measured from the live 0.5.4 log first
+
+| Measurement (busiest driving window, 300 frames) | Result |
+|---|---|
+| `unrefreshedFrames` | **0** — Cinemachine is *not* skipping frames, so 0.5.2's idempotency work was a no-op |
+| Camera **position**: direction reversals | **0.0%** — translation is smooth, not the culprit |
+| Camera **rotation**: per-frame | mean **5.32°**, max **22.3°** |
+| Camera **rotation**: direction reversals | **6.4%**, mean **2.57°**, max **6.38°** |
+
+Those reversing rotation steps *are* the shake. Position was already clean.
+
+### Cause
+
+```csharp
+t.rotation = t.rotation * rotOffset;   // POST-multiply == camera's own axes
+```
+
+Post-multiplying applies the phone's delta about the **camera's** axes. While driving those axes tilt
+constantly — `CarX.FollowCamera` pitches and rolls the camera (sway) and yaws it hard to follow a drift.
+So a *constant* phone offset produced a *changing* world-space rotation: the aim wobbled with the sway
+even with the phone perfectly still. Parked, the axes are steady and the same offset is rock solid —
+exactly "jitters whenever the car moves".
+
+### Fix
+
+Apply the delta as a similarity transform in the stable frame, pre-multiplied:
+
+```csharp
+Quaternion stableDelta = offsetFrame * rotOffset * Quaternion.Inverse(offsetFrame);
+t.rotation = stableDelta * t.rotation;
+```
+
+Phone yaw now always yaws about world up, phone pitch always pitches about the car's right axis,
+whatever the camera is doing. Applied in **both** the orbit and non-orbit paths.
+
+### Verification (`tools/rotation_frame_proof.py`)
+
+Phone held perfectly still. Measured as the rotation **our offset contributes**, expressed in the car's
+frame — with a still phone that must be constant, so any variation is our artefact:
+
+| | ≤0.5.4 (camera-local) | 0.5.5 (stable axes) |
+|---|---|---|
+| Parked | 0.00° | 0.0000° |
+| **Driving / drifting** | **1.89° of oscillating aim error** | **0.0000°** |
+
+Isolating that took a correction: measuring the camera's *absolute* aim includes CarX's own sway, which
+is legitimate motion and showed ~17° in **both** modes, telling us nothing. Only the contributed delta
+isolates the artefact. The 1.89° figure is consistent with the 2.57° mean reversal measured in the real
+log. 7/7 harnesses pass.
+
+**Note on smoothing:** the log shows `posSmoothing=0.67 rotSmoothing=0.83`, which is very responsive and
+passes phone noise through nearly unfiltered. If any fine shimmer remains after this, lowering
+**Rotation smoothing** toward ~0.4 is the intended control — it is now a genuine time-based filter.
+
 **0.5.4** - Fixes the drive/drift shake at its actual source, and adds the missing translation invert.
 
 ### 1. Shake while driving, steady when parked
