@@ -22,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.4.5", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.4.6", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.4.5";
+		private const string CurrentVersion = "0.4.6";
 
 		private const int DefaultOscPort = 9000;
 
@@ -74,6 +74,11 @@ namespace HeadTrackARKit {
 		// "is the camera moving enough to see" is a number in the log rather than a judgement call.
 		private Vector3 lastOrbitEuler_;
 		private float lastOrbitTravel_;
+
+		// 0.4.6: bounds on the orbit arc - see the clamp in OnCameraPreCull for the measured reason.
+		// Yaw gets a usable arc; pitch stays small because pitch is what swings the camera under the car.
+		private const float MaxOrbitYawDegrees = 55f;
+		private const float MaxOrbitPitchDegrees = 18f;
 
 		// 0.3.17: see the comment at the write site in OnCameraPreCull - ground-truth camera
 		// world position after this mod's own Transform write, for isolating whether an offset
@@ -781,6 +786,22 @@ namespace HeadTrackARKit {
 					// degrees in normal use; at 1:1 on a ~4.7 m boom that is under a metre of travel.
 					float orbitGain = Mathf.Max(0.1f, config_.OrbitSensitivity);
 					Vector3 offsetEuler = lastAppliedOffsetEuler_ * orbitGain;
+
+					// 0.4.6: CLAMP THE ORBIT ARC. Measured from a real 0.4.5 session, the unclamped
+					// version at the old 5x default produced orbitEuler of (x=-146, y=174) - i.e. the
+					// camera swung essentially all the way around the car AND flipped underneath it.
+					// End-of-render positions in that same window spanned 10 m on every axis with y
+					// reaching -8.93, several metres below the car. A camera buried under the track or
+					// inside the car's mesh renders the inside of geometry: a flat, featureless, nearly
+					// unchanging image - which looks exactly like "the camera is not moving at all",
+					// while every diagnostic correctly reports large movement. Unbounded orbit is
+					// therefore not just uncomfortable, it is self-defeating.
+					//
+					// Yaw is allowed a wide but bounded arc; pitch is kept small, because pitch is the
+					// axis that drives the camera under the car and through the ground.
+					offsetEuler.y = Mathf.Clamp(offsetEuler.y, -MaxOrbitYawDegrees, MaxOrbitYawDegrees);
+					offsetEuler.x = Mathf.Clamp(offsetEuler.x, -MaxOrbitPitchDegrees, MaxOrbitPitchDegrees);
+
 					Quaternion orbit = Quaternion.AngleAxis(offsetEuler.y, Vector3.up) *
 					                   Quaternion.AngleAxis(offsetEuler.x, Vector3.right);
 
@@ -788,6 +809,15 @@ namespace HeadTrackARKit {
 					// is neutral (orbit == identity => orbitedLocal == anchorLocalPosition_), which is
 					// what guarantees this can never subtract CarX's own motion.
 					Vector3 orbitedLocal = pivotLocal + orbit * boomLocal;
+
+					// Hard floor in the car's own frame: never let the orbit put the camera below where
+					// it was calibrated. Even with pitch clamped, a low calibration seat plus a downward
+					// swing can still dip under the car, and being underground is the specific failure
+					// that renders as a static void.
+					if (orbitedLocal.y < anchorLocalPosition_.y) {
+						orbitedLocal.y = anchorLocalPosition_.y;
+					}
+
 					Vector3 orbitDeltaLocal = orbitedLocal - anchorLocalPosition_;
 					Vector3 orbitDeltaWorld = car.rotation * orbitDeltaLocal;
 
@@ -1680,9 +1710,16 @@ namespace HeadTrackARKit {
 
 			// See IHeadTrackConfig.OrbitSensitivity - 1:1 orbit is measurably too subtle to perceive, so
 			// this starts at 5x. One-time, so tuning the slider afterward sticks.
-			if (config_.OrbitSensitivity <= 0) config_.OrbitSensitivity = 5.0f;
+			if (config_.OrbitSensitivity <= 0) config_.OrbitSensitivity = 2.0f;
+
+			// 0.4.6: the 0.4.3 default of 5x measurably overshot - it drove the orbit to 174 degrees of
+			// yaw and -146 of pitch, flinging the camera 10 m and underneath the car. Reset once to 2x,
+			// which with the new arc clamps keeps the camera in a usable sweep beside the car.
+			if (!config_.OrbitSensitivityRetuned) {
+				config_.OrbitSensitivity = 2.0f;
+				config_.OrbitSensitivityRetuned = true;
+			}
 			if (!config_.OrbitSensitivityDefaulted) {
-				config_.OrbitSensitivity = 5.0f;
 				config_.OrbitSensitivityDefaulted = true;
 			}
 
@@ -1786,7 +1823,7 @@ namespace HeadTrackARKit {
 
 			if (orbitMode) {
 				float orbitSens = config_.OrbitSensitivity;
-				if (Kino.UI.Slider(ref orbitSens, 1f, 15f, $"Orbit strength: {orbitSens:F1}x")) {
+				if (Kino.UI.Slider(ref orbitSens, 0.5f, 6f, $"Orbit strength: {orbitSens:F1}x")) {
 					config_.OrbitSensitivity = orbitSens;
 				}
 				Kino.UI.Label("Turn/tilt the phone to swing the camera around the car. Raise this if the movement is too subtle.");

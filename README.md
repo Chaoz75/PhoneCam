@@ -9,6 +9,52 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.4.6** - Clamps the orbit arc. The camera was not stationary - it was being thrown so far that it
+ended up underneath the car, and rendering from inside geometry looks static.
+
+### The measurement
+
+End-of-render camera positions during the live window of the 0.4.5 session - read from the matrix that
+actually produced the pixels, not from our own write:
+
+| Axis | Range |
+|---|---|
+| x | -13.20 to -3.20 (**10.00 m**) |
+| y | **-8.93** to +1.09 (**10.02 m**) |
+| z | -12.97 to -3.58 (9.39 m) |
+
+The camera was moving through 10 m on every axis. `orbitEuler` reached **pitch -146, yaw 174** - nearly
+a full revolution around the car, and flipped beneath it. With the seat calibrated at car-local
+`(0.00, 2.87, -3.96)`, a y of -8.93 puts the camera several metres *below* the car, inside the track
+mesh. A camera inside geometry renders the backfaces of that geometry: a flat, featureless, barely
+changing image. So every diagnostic correctly reported enormous movement while the screen showed
+something that looks exactly like a frozen camera. The 5x default from 0.4.3 caused this.
+
+### The fix
+
+- Orbit yaw clamped to +/-55 deg, pitch to +/-18 deg. Pitch is the axis that swings the camera under
+  the car, so it gets the tighter bound.
+- Hard floor in the car's frame: the orbit can never place the camera below the calibrated seat height.
+- Default `OrbitSensitivity` reset once from 5x to **2x**; slider range narrowed from 1-15x to 0.5-6x.
+
+### Verification (`tools/orbit_clamp_proof.py`)
+
+Driven by the actual `orbitEuler` values logged when the camera appeared frozen:
+
+| pitch, yaw (logged) | Unclamped cam y | Under car? | Clamped cam y | Under car? |
+|---|---|---|---|---|
+| -39, 115 | -0.39 | **yes** | 2.87 | no |
+| -38, 126 | -0.31 | **yes** | 2.87 | no |
+| -146, 174 | -2.76 | **yes** | 2.87 | no |
+| -56, 122 | -1.68 | **yes** | 2.87 | no |
+| -30, 124 | 0.35 | **yes** | 2.87 | no |
+| -16, -3 | 1.54 | **yes** | 2.87 | no |
+
+6 of 7 real samples put the camera under the car before; 0 of 7 after. An exhaustive sweep of all
+14,641 reachable angle pairs gives a lowest camera y of exactly the seat height (2.87) and a maximum
+travel of 4.39 m. A typical 8 degree phone turn at the new 2x default still moves the camera 1.31 m -
+visible, not chaotic. 3/3 pass; the earlier 9 geometry and 3 regression checks still pass.
+
 **0.4.4** - Fixes the regression introduced in 0.4.0. The camera was frozen *because of* that change,
 not despite it.
 

@@ -189,7 +189,17 @@ namespace HeadTrackARKit {
 		/// </summary>
 		float OrbitSensitivity { get; set; }
 
-		/// <summary>One-time migration so <see cref="OrbitSensitivity"/> starts at a usable 5x.</summary>
+		/// <summary>One-time migration so <see cref="OrbitSensitivity"/> starts at a usable value.</summary>
 		bool OrbitSensitivityDefaulted { get; set; }
+
+		/// <summary>
+		/// One-time correction of the 0.4.3 default. 5x was measurably too strong: a real session drove
+		/// the orbit to 174 degrees of yaw and -146 of pitch, moving the camera through 10 m on every
+		/// axis and putting it several metres BELOW the car. A camera inside the track or the car's mesh
+		/// renders the inside of geometry - a flat, near-static image that reads as "the camera isn't
+		/// moving" even though it is moving enormously. Resets to 2x once, alongside the arc clamps in
+		/// HeadTrackMod (MaxOrbitYawDegrees / MaxOrbitPitchDegrees).
+		/// </summary>
+		bool OrbitSensitivityRetuned { get; set; }
 	}
 }
