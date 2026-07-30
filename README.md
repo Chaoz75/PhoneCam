@@ -9,6 +9,73 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.5.0** - **THE root cause.** Every version of this mod up to 0.4.6 wrote the camera pose too late
+in the frame for HDRP to ever use it. Not a math bug, not a tracking bug — a frame-ordering bug.
+
+### Proof, from the game's own compiled assemblies
+
+`HDRenderPipeline.PrepareAndCullCamera` (disassembled from
+`Unity.RenderPipelines.HighDefinition.Runtime.dll`) calls, in this order:
+
+```
+IL_A5441   TryCalculateFrameParameters
+              IL_A74AF   HDCamera::GetOrCreate
+              IL_A74E7   HDCamera::Update              <-- view matrix captured HERE
+              IL_A7567   Camera::TryGetCullingParameters
+IL_A5568   TryCull                                     (calls BeginCameraRendering @ IL_A7963)
+IL_A55BF   BeginCameraRendering                        <-- our old write hook
+```
+
+Both `BeginCameraRendering` call sites in the entire assembly (`PrepareAndCullCamera` @ `IL_A55BF`,
+`TryCull` @ `IL_A7963`) are reached **after** `TryCalculateFrameParameters`. So by the time this mod's
+callback ran, HDRP had already snapshotted the camera's view matrix and computed culling for the frame.
+**Writing `camera.transform` there changes nothing that gets rendered.** The frame draws from CarX's
+pose; then `CinemachineBrain.LateUpdate` (via `ProcessActiveCamera` → `PushStateToUnityCamera`, the only
+transform writers on that type) overwrites our value before anything reads it again.
+
+This mod's pose write has never affected a single rendered pixel, in any version.
+
+### Why every diagnostic said otherwise
+
+`endOfRender` compared `transform.position` against `worldToCameraMatrix`. With no explicit matrix
+override set, **Unity derives `worldToCameraMatrix` from the Transform on demand** — so the two agreed
+trivially, every time. The check was circular: it could only confirm that our own assignment landed on
+the Transform, never that HDRP used it. That is why 20+ versions of geometry changes produced confident
+"the camera is moving" reports and zero visible change.
+
+### The fix
+
+The pose write moved to **`Application.onBeforeRender`**, which fires after every `LateUpdate` (so after
+the Brain has pushed its pose) and before the render pipeline runs (so before `HDCamera.Update`
+snapshots anything). It is the same callback Unity's own XR late-latching uses, for exactly this reason.
+
+`RenderPipelineManager.beginCameraRendering` and `Camera.onPreCull` are now **diagnostics only**.
+
+Because the hook sits downstream of whatever camera controller CarX used that frame, it works
+identically for chase, cockpit, hood/roof/bumper, rear, static, Photo Mode and the free drone camera —
+they all resolve to a Transform by end of `LateUpdate`, and none needs special-casing.
+
+`OnEndCameraRendering` now performs a **real** overwrite check: it compares against the pose this mod
+wrote in `onBeforeRender`, which is separated from the read by the entire render, and logs
+`OVERWRITTEN: …` if they diverge.
+
+### Verification (`tools/frame_order_proof.py`)
+
+Executable model of the frame, ordered from the disassembly above:
+
+| Stage | ≤0.4.6 | 0.5.0 |
+|---|---|---|
+| `LateUpdate` (Brain writes) | CarX pose | CarX pose |
+| `Application.onBeforeRender` | *not hooked* | **CarX pose + phone offset** |
+| `HDCamera.Update` **(snapshot)** | CarX pose | **CarX pose + phone offset** |
+| `beginCameraRendering` | CarX pose + phone offset *(too late)* | diagnostics only |
+| **rendered to screen** | **CarX pose** | **CarX pose + phone offset** |
+| what the old diag read | CarX pose + phone offset | — |
+
+The "before" column reproduces the reported symptom exactly: screen static, diagnostics reporting
+movement. 3/3 pass, plus mode-independence across all 7 camera controllers. The earlier 9 geometry,
+3 regression and 3 orbit-clamp checks still pass.
+
 **0.4.6** - Clamps the orbit arc. The camera was not stationary - it was being thrown so far that it
 ended up underneath the car, and rendering from inside geometry looks static.
 

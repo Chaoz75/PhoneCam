@@ -22,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.4.6", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.5.0", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.4.6";
+		private const string CurrentVersion = "0.5.0";
 
 		private const int DefaultOscPort = 9000;
 
@@ -74,6 +74,12 @@ namespace HeadTrackARKit {
 		// "is the camera moving enough to see" is a number in the log rather than a judgement call.
 		private Vector3 lastOrbitEuler_;
 		private float lastOrbitTravel_;
+
+		// 0.5.0: the pose this mod actually wrote in Application.onBeforeRender this frame, so
+		// OnEndCameraRendering can compare against it rather than against a value Unity derives from
+		// the very Transform we just set. Cleared each frame in LateUpdate.
+		private Vector3 poseWrittenPosition_;
+		private bool poseWrittenThisFrame_;
 
 		// 0.4.6: bounds on the orbit arc - see the clamp in OnCameraPreCull for the measured reason.
 		// Yaw gets a usable arc; pitch stays small because pitch is what swings the camera under the car.
@@ -279,6 +285,12 @@ namespace HeadTrackARKit {
 			// before it renders, same as onPreCull's timing guarantee) - subscribing to both costs
 			// nothing, since a project only ever runs one pipeline at a time, so only the relevant
 			// one will ever actually call back.
+			// 0.5.0: THE pose-write hook - see OnBeforeRender's doc comment. Fires after every
+			// LateUpdate (so after CinemachineBrain has pushed its pose to the camera) and before the
+			// render pipeline runs (so before HDRP's HDCamera.Update snapshots the view matrix). The
+			// two subscriptions below are diagnostics only now.
+			Application.onBeforeRender += OnBeforeRender;
+
 			Camera.onPreCull += OnCameraPreCull;
 			RenderPipelineManager.beginCameraRendering += OnBeginCameraRendering;
 
@@ -294,6 +306,7 @@ namespace HeadTrackARKit {
 		}
 
 		private void OnDestroy() {
+			Application.onBeforeRender -= OnBeforeRender;
 			Camera.onPreCull -= OnCameraPreCull;
 			RenderPipelineManager.beginCameraRendering -= OnBeginCameraRendering;
 			RenderPipelineManager.endCameraRendering -= OnEndCameraRendering;
@@ -436,6 +449,10 @@ namespace HeadTrackARKit {
 		}
 
 		private void LateUpdate() {
+			// 0.5.0: reset the per-frame overwrite-check flag. LateUpdate runs before
+			// Application.onBeforeRender, so this always clears ahead of that frame's write.
+			poseWrittenThisFrame_ = false;
+
 			// A C# multicast event invokes its subscribers in registration order. Unsubscribing
 			// then immediately re-subscribing moves this mod's handler to the END of that list,
 			// which means it runs after anything else that also touches the camera this frame -
@@ -666,33 +683,67 @@ namespace HeadTrackARKit {
 			}
 		}
 
+		/// <summary>
+		/// 0.5.0 - THE ACTUAL ROOT CAUSE FIX. This is where the tracked pose is now written, and the
+		/// reason nothing this mod did to the camera has ever appeared on screen.
+		///
+		/// Every version up to 0.4.6 wrote the camera pose from
+		/// <see cref="OnBeginCameraRendering"/> (RenderPipelineManager.beginCameraRendering). That is
+		/// too late in an HDRP frame. Disassembling the game's own
+		/// Unity.RenderPipelines.HighDefinition.Runtime.dll settles it - inside
+		/// HDRenderPipeline.PrepareAndCullCamera, the very first call is TryCalculateFrameParameters,
+		/// and that method does:
+		///
+		///     IL_A74AF  HDCamera::GetOrCreate
+		///     IL_A74E7  HDCamera::Update              &lt;-- captures the camera's view matrix
+		///     IL_A7567  Camera::TryGetCullingParameters
+		///
+		/// while BeginCameraRendering is only reached much later (IL_A55BF in PrepareAndCullCamera,
+		/// and IL_A7963 inside TryCull - both after that first call). By the time our callback ran,
+		/// HDRP had ALREADY snapshotted the view matrix and computed culling for the frame. Writing
+		/// camera.transform at that point changes nothing that is rendered: the frame draws from
+		/// CarX's pose, and then CinemachineBrain.LateUpdate (via ProcessActiveCamera ->
+		/// PushStateToUnityCamera - the only places the Brain writes the transform) overwrites our
+		/// value before anything reads it again.
+		///
+		/// That is why every diagnostic looked correct while the screen never moved: we wrote the
+		/// Transform, read it straight back, and compared it against worldToCameraMatrix - which Unity
+		/// derives FROM that same Transform on demand. The check was circular. It could only ever have
+		/// confirmed that our own assignment took effect on the Transform, never that HDRP used it.
+		///
+		/// Application.onBeforeRender fires after every LateUpdate (so after the Brain has written its
+		/// pose) and before the render pipeline runs (so before HDCamera.Update captures anything).
+		/// That is precisely the window this mod needs, and it is the same callback Unity's own XR
+		/// late-latching uses for exactly this reason. Because it sits after whatever camera
+		/// controller CarX used this frame, it works identically for chase, cockpit, hood, roof,
+		/// bumper, interior and Photo Mode - they all resolve to a Transform by end of LateUpdate,
+		/// and all of them are perturbed here without this mod needing to know which one is active.
+		/// </summary>
+		private void OnBeforeRender() {
+			if (!config_.Enabled) return;
+
+			Camera cam = GetActiveCamera();
+			if (cam == null || cam.targetTexture != null || cam.orthographic) return;
+
+			ApplyTrackingToCamera(cam);
+		}
+
+		/// <summary>
+		/// Diagnostics only as of 0.5.0. The pose write moved to <see cref="OnBeforeRender"/> - see its
+		/// doc comment for why writing from here could never affect the rendered image under HDRP.
+		/// </summary>
 		private void OnCameraPreCull(Camera cam) {
-			// Runs regardless of the Enabled toggle now - the previous diagnostic build (0.3.1)
-			// gated this on config_.Enabled and came back with zero diag lines even after a full
-			// play session, which was ambiguous: either Enabled was actually off, or onPreCull
-			// never fires for whatever camera Kino's custom camera system uses. Logging
-			// unconditionally settles which one it is.
+			// Runs regardless of the Enabled toggle - "no diag lines at all" would otherwise be
+			// ambiguous between "Enabled was off" and "this hook never fires for the render camera".
 			LogCameraDiagnostics(cam);
 
 			if (!config_.Enabled) {
-				// Make sure a previous frame's override doesn't linger once the mod is turned
-				// off - without this, the view would stay stuck at its last head-tracked pose
-				// instead of snapping back to whatever the game's own camera logic drives it to.
+				// Make sure a previous frame's override doesn't linger once the mod is turned off.
 				ResetCameraOverride(cam);
-				return;
 			}
+		}
 
-			// 0.3.4's real fix (SRP hook) proved the plumbing works: GetActiveCamera() correctly
-			// resolved to the actual render camera the whole session. But the goal now is a
-			// free-cam-style override that works in *every* mode CarX/Kino can be in, including
-			// Photo Mode, without needing to special-case each one - so instead of trusting
-			// CameraSwitch/UIPhotoModeContext to say which camera is "the" camera, just apply to
-			// whichever camera Unity is actually about to render to the screen. `cam` here already
-			// is exactly that, every time this fires - the only cameras to skip are ones that
-			// obviously aren't the player's view: anything rendering to an offscreen buffer
-			// (targetTexture != null - reflection probes, minimap, icon generation, etc.) or an
-			// orthographic camera (2D HUD/UI overlays, if this game has any as separate cameras).
-			if (cam.targetTexture != null || cam.orthographic) return;
+		private void ApplyTrackingToCamera(Camera cam) {
 
 			// Zoom applies independently of head-tracking calibration.
 			bool hasZoom = Mathf.Abs(zoomCurrentDegrees_) > 0.001f;
@@ -864,6 +915,10 @@ namespace HeadTrackARKit {
 				// opposed to something else (e.g. CarX/Kino's own follow-cam logic) overwriting it
 				// again before the frame actually renders.
 				lastCameraWorldPosAfterWrite_ = t.position;
+
+				// 0.5.0: recorded so OnEndCameraRendering can do a real overwrite check - see there.
+				poseWrittenPosition_ = t.position;
+				poseWrittenThisFrame_ = true;
 			}
 
 			// 0.3.19 root-caused, 0.3.22 patched with hysteresis, 0.3.25 fixes properly: the
@@ -958,8 +1013,30 @@ namespace HeadTrackARKit {
 		private void OnEndCameraRendering(ScriptableRenderContext context, Camera cam) {
 			if (!config_.Enabled || cam == null || cam.targetTexture != null || cam.orthographic) return;
 
+			// 0.5.0: the honest version of this check.
+			//
+			// Comparing transform.position against worldToCameraMatrix was circular: with no explicit
+			// matrix override set, Unity DERIVES worldToCameraMatrix from the Transform on demand, so
+			// the two agreed trivially every time and the check could never have detected the actual
+			// problem (HDRP having already snapshotted its own copy before we wrote anything). It is
+			// kept below only to detect an explicit matrix reassignment by something else.
+			//
+			// The meaningful comparison is against the pose WE wrote in Application.onBeforeRender
+			// earlier this frame. That value is separated from this read by the entire render, so a
+			// mismatch means something genuinely overwrote the camera in between - which is the
+			// question this diagnostic was always supposed to answer.
 			Vector3 transformPos = cam.transform.position;
 			Vector3 matrixDecodedPos = cam.worldToCameraMatrix.inverse.MultiplyPoint3x4(Vector3.zero);
+
+			if (poseWrittenThisFrame_) {
+				float drift = (transformPos - poseWrittenPosition_).magnitude;
+				if (drift > 0.01f) {
+					Kino.Log.Warning(
+						$"[HeadTrackARKit][diag] OVERWRITTEN: wrote {FormatVector(poseWrittenPosition_)} in " +
+						$"onBeforeRender, but cam='{cam.name}' reads {FormatVector(transformPos)} at end of " +
+						$"render ({drift:F2} m of drift) - something else is writing this camera.");
+				}
+			}
 
 			// 0.3.29: this diagnostic has proven position survives to the final render, every time
 			// it's been checked, across dozens of logs - but it has never once checked ROTATION the
