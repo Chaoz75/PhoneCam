@@ -9,6 +9,65 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.4.1** - Root-cause investigation of "the camera still doesn't move" on 0.4.0, plus the two
+defects that investigation exposed. **No changes to the camera pipeline.**
+
+### What the evidence showed
+
+The 0.4.0 session (`kino/output.log`, 2026-07-29 16:00-16:09) contains, across all 134 heartbeats:
+
+| Evidence | Value | Meaning |
+|---|---|---|
+| `Loaded. Enabled=` | **False** | mod switched off at load |
+| `Enabled toggled` events | **0** | never switched on during the session |
+| `receiverRunning=` | **False** (every line) | OSC listener never started |
+| `totalRawPacketsReceived=` | **0** (every line) | not one packet arrived, ever |
+| `Neutral position set` | **absent** | never calibrated |
+| `calibrated=` | **False** (134/134) | ditto |
+| `Listening for LOTA` | **absent** | confirms the listener never started |
+
+`config_.Enabled` persists in `kino/config/PhoneCam.ksc`. The previous session's final logged action was
+`Enabled toggled OFF from the settings panel`; that was saved, and 0.4.0 loaded with it still false.
+
+With `Enabled=false`, `OnCameraPreCull` returns at its first guard:
+
+```csharp
+if (!config_.Enabled) {
+    ResetCameraOverride(cam);
+    return;          // every frame, before anything touches the camera
+}
+```
+
+So the camera-pose code never ran, `StartReceiver()` was never called (it is gated on the same flag),
+and `OnGUI` returned at its own `!config_.Enabled` guard - which is why the status HUD was blank too.
+
+**The 0.4.0 car-anchored rig has never executed a single frame.** `hasCarAnchor=False` and
+`cameraMode=additive-fallback` on all 134 heartbeats. It is unvalidated in-game, not disproven.
+
+No elaborate frame-order/overwrite instrumentation was added, because the evidence rules that class of
+cause out for this session: our code did not run, so nothing could have overwritten it. Instrumenting
+for an overwrite that provably did not occur would be wasted work.
+
+### Defects fixed
+
+1. **The mod was silent in the one state that most needs feedback.** `OnGUI` was gated on
+   `config_.Enabled`, so "switched off" and "broken" looked identical on screen. The HUD now reports
+   `PhoneCam: DISABLED - tick 'Enabled' in the PhoneCam settings panel` (orange), and only the
+   `ShowStatusHud` option can suppress it.
+2. **The log required reading absence to diagnose.** Establishing the above meant noticing which lines
+   were *missing* and inferring backwards. The heartbeat now states the two hard preconditions
+   positively: `INERT: config.Enabled=false ...` or `INERT: not calibrated ...`.
+
+### Instrumentation added
+
+`LogCameraOwnership` dumps, once per distinct camera, the things that position values cannot reveal:
+the full **parent chain** (a camera parented under a rig node is moved by that node, so writing
+world-space position to the child fights the parent every frame), **every component on the camera's
+GameObject** (which identifies the systems able to write the transform in `LateUpdate`), and
+explicitly whether a **`CinemachineBrain`** is present - the Brain is what applies
+`CarX.FollowCamera`'s `CinemachineVirtualCamera` solve to the Transform. Read-only, first-sighting
+only.
+
 **0.4.0** - Replaces the camera control architecture with a car-anchored rig. This is the fix for
 the long-running "objects move but my camera doesn't" report.
 

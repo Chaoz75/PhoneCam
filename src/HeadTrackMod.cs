@@ -22,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.4.0", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.4.1", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.4.0";
+		private const string CurrentVersion = "0.4.1";
 
 		private const int DefaultOscPort = 9000;
 
@@ -420,12 +420,24 @@ namespace HeadTrackARKit {
 		/// able status indicator, not a replacement for the settings panel's fuller detail.
 		/// </summary>
 		private void OnGUI() {
-			if (!config_.Enabled || !config_.ShowStatusHud) return;
+			// 0.4.1: this used to also return when !config_.Enabled, which was exactly backwards.
+			// "Enabled is off" is the single state where on-screen feedback matters most - the mod is
+			// completely inert, nothing responds, and there is no indication anywhere on screen as to
+			// why. A real session (0.4.0, 2026-07-29 16:00-16:09) was spent entirely in that state:
+			// Enabled persisted false from the previous session's last action, the OSC listener never
+			// started, zero packets arrived, nothing was ever calibrated, and the HUD stayed blank
+			// because of this very guard - so the mod looked identical to a broken one. Now the
+			// disabled state is reported explicitly and only ShowStatusHud can suppress the HUD.
+			if (!config_.ShowStatusHud) return;
 
 			string text;
 			Color color;
 
-			if (!receiver_.IsRunning) {
+			if (!config_.Enabled) {
+				text = "PhoneCam: DISABLED - tick 'Enabled' in the PhoneCam settings panel to turn tracking on";
+				color = new Color(1f, 0.55f, 0f); // orange: not an error, just switched off
+			}
+			else if (!receiver_.IsRunning) {
 				text = "PhoneCam: OSC listener not running (toggle Enabled off/on to retry)";
 				color = Color.red;
 			}
@@ -927,6 +939,7 @@ namespace HeadTrackARKit {
 					$"[HeadTrackARKit][diag] Camera seen: '{cam.name}' tag={cam.tag} " +
 					$"targetTexture={(cam.targetTexture != null ? "yes" : "no")} " +
 					$"depth={cam.depth} isResolvedActive={cam == active}");
+				LogCameraOwnership(cam);
 			}
 
 			if (Time.unscaledTime - lastDiagnosticLogTime_ > 2f) {
@@ -965,6 +978,24 @@ namespace HeadTrackARKit {
 					$"[HeadTrackARKit][diag] cameraMode={(diagCar != null ? "rig(car-anchored)" : "additive-fallback")} " +
 					$"hasCarAnchor={hasCarAnchor_} car={(diagCar != null ? diagCar.name : "(none)")} " +
 					$"anchorLocalPos={FormatVector(anchorLocalPosition_)}");
+
+				// 0.4.1: state the two hard preconditions outright, every heartbeat. Working out that
+				// a whole session had Enabled=false previously required noticing which log lines were
+				// *absent* (no "Listening for LOTA", no "Neutral position set", no toggle event) and
+				// inferring backwards - which is a bad way to read a log. If the camera isn't moving,
+				// exactly one of these two being false is the first thing to rule out, so it should be
+				// stated positively rather than reconstructed.
+				if (!config_.Enabled) {
+					Kino.Log.Warning(
+						"[HeadTrackARKit][diag] INERT: config.Enabled=false - OnCameraPreCull returns before " +
+						"touching the camera and the OSC listener is not started. Nothing can move until " +
+						"'Enabled' is ticked in the PhoneCam settings panel.");
+				}
+				else if (!state_.IsCalibrated) {
+					Kino.Log.Warning(
+						"[HeadTrackARKit][diag] INERT: not calibrated - the camera pose block is skipped " +
+						"entirely until F9 is pressed while data is arriving.");
+				}
 				// Position diagnostics (0.3.14) - see the field comments on lastRawArPosition_/
 				// lastAppliedPosOffset_ for why this exists.
 				Kino.Log.Info(
@@ -1114,6 +1145,60 @@ namespace HeadTrackARKit {
 					return component != null ? component.transform : null;
 				default:
 					return null;
+			}
+		}
+
+		/// <summary>
+		/// 0.4.1: dumps who actually owns a camera's Transform, once per distinct camera. Added
+		/// because several of the open questions about this mod ("is the offset going to the camera
+		/// that's really rendering", "does something restore the transform after we write it", "does a
+		/// parent transform override the child") are not answerable by watching position values - they
+		/// need the object graph. This logs it directly instead:
+		///
+		/// - the full parent chain, since a camera parented under a rig node is moved by that node and
+		///   writing world-space position to the child is then fighting the parent every frame;
+		/// - every component on the camera's own GameObject, which is what identifies the systems that
+		///   can write the transform in LateUpdate. A CinemachineBrain here is the important one:
+		///   Assembly-CSharp shows CarX's chase cam (CarX.FollowCamera) drives a
+		///   CinemachineVirtualCamera, and it is the Brain on the camera object that applies the
+		///   virtual camera's solved pose to this Transform;
+		/// - whether the camera object is the same GameObject the Brain/controller lives on.
+		///
+		/// Read-only and first-sighting-only, so it cannot perturb what it's measuring or spam.
+		/// </summary>
+		private static void LogCameraOwnership(Camera cam) {
+			try {
+				Transform t = cam.transform;
+
+				var chain = new List<string>();
+				for (Transform p = t; p != null; p = p.parent) {
+					chain.Add(p.name);
+				}
+				chain.Reverse();
+				Kino.Log.Info(
+					$"[HeadTrackARKit][diag]   hierarchy: {string.Join(" / ", chain.ToArray())} " +
+					$"(depth={chain.Count}, parent={(t.parent != null ? t.parent.name : "(root)")})");
+
+				Component[] components = cam.GetComponents<Component>();
+				var names = new List<string>();
+				bool hasBrain = false;
+				foreach (Component c in components) {
+					if (c == null) continue;
+					string typeName = c.GetType().Name;
+					names.Add(typeName);
+					if (typeName.IndexOf("CinemachineBrain", StringComparison.OrdinalIgnoreCase) >= 0) {
+						hasBrain = true;
+					}
+				}
+				Kino.Log.Info(
+					$"[HeadTrackARKit][diag]   components on '{cam.name}': {string.Join(", ", names.ToArray())}");
+				Kino.Log.Info(
+					$"[HeadTrackARKit][diag]   cinemachineBrainPresent={hasBrain} " +
+					$"localPos={FormatVector(t.localPosition)} worldPos={FormatVector(t.position)}");
+			}
+			catch (Exception ex) {
+				// Diagnostics must never be able to take the mod down.
+				Kino.Log.Warning($"[HeadTrackARKit][diag] camera ownership dump failed: {ex.Message}");
 			}
 		}
 
