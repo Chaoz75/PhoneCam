@@ -22,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.5.1", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.5.2", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.5.1";
+		private const string CurrentVersion = "0.5.2";
 
 		private const int DefaultOscPort = 9000;
 
@@ -80,6 +80,15 @@ namespace HeadTrackARKit {
 		// the very Transform we just set. Cleared each frame in LateUpdate.
 		private Vector3 poseWrittenPosition_;
 		private bool poseWrittenThisFrame_;
+
+		// 0.5.2: idempotency state for the additive write - see RestoreGameBasePoseIfUnrefreshed.
+		// gameBase* is the pose the game handed us; poseWeWrote* is what we left on the transform.
+		private Vector3 gameBasePosition_;
+		private Quaternion gameBaseRotation_ = Quaternion.identity;
+		private Vector3 poseWeWrotePosition_;
+		private Quaternion poseWeWroteRotation_ = Quaternion.identity;
+		private bool hasGameBasePose_;
+		private int unrefreshedFrames_;
 
 		// 0.4.6: bounds on the orbit arc - see the clamp in OnCameraPreCull for the measured reason.
 		// Yaw gets a usable arc; pitch stays small because pitch is what swings the camera under the car.
@@ -722,6 +731,11 @@ namespace HeadTrackARKit {
 		private void OnBeforeRender() {
 			if (!config_.Enabled) return;
 
+			// 0.5.2: advance the smoothing filter exactly once per frame, against real elapsed time -
+			// see HeadTrackState.UpdateSmoothing for why doing it per received packet was itself a
+			// jitter source.
+			state_.UpdateSmoothing(Time.unscaledDeltaTime);
+
 			Camera cam = GetActiveCamera();
 			if (cam == null || cam.targetTexture != null || cam.orthographic) return;
 
@@ -740,6 +754,47 @@ namespace HeadTrackARKit {
 			if (!config_.Enabled) {
 				// Make sure a previous frame's override doesn't linger once the mod is turned off.
 				ResetCameraOverride(cam);
+			}
+		}
+
+		/// <summary>
+		/// 0.5.2 - FIXES THE DRIVING JITTER.
+		///
+		/// The pose write is additive (<c>t.position += t.rotation * posOffset</c>), which silently
+		/// assumes something restores the camera to the game's own pose every rendered frame. That
+		/// assumption is false. Cinemachine's own metadata shows why: CinemachineBrain has
+		/// <c>m_UpdateMethod</c> (FixedUpdate / LateUpdate / <b>SmartUpdate</b> / ManualUpdate),
+		/// <c>m_BlendUpdateMethod</c>, and - decisively - <c>m_LastFrameUpdated</c> and
+		/// <c>mWaitForFixedUpdate</c> fields, alongside CinemachineCore.GetVcamUpdateStatus /
+		/// GetUpdateTarget. The Brain deliberately tracks which frame it last pushed a pose and skips
+		/// frames; under SmartUpdate a physics-tracked target is driven at the FIXED timestep, so at any
+		/// framerate above that timestep some rendered frames get no fresh Brain write at all.
+		///
+		/// On exactly those frames the old code added the offset on top of a transform that ALREADY
+		/// contained the previous frame's offset. The camera crept further out each un-refreshed frame,
+		/// the next Brain write snapped it back, and the cycle repeated - a back-and-forth shake that
+		/// only appears while driving, because that is when the physics/render rate mismatch and the
+		/// camera's own motion are both live. Latent since 0.3.8; invisible until 0.5.0 made the write
+		/// actually reach the screen.
+		///
+		/// The fix is to make the write idempotent. We remember both the pose the game handed us and the
+		/// pose we wrote. If the transform still reads back as our own pose, nobody refreshed it, so the
+		/// game's pose is restored before applying this frame's offset. When the game DOES refresh, the
+		/// new value is used as the base exactly as before - so genuine additive behaviour, and CarX's
+		/// sway and follow, are preserved.
+		/// </summary>
+		private void RestoreGameBasePoseIfUnrefreshed(Transform t) {
+			if (!hasGameBasePose_) return;
+
+			// Tight epsilons: only treat this as "unrefreshed" when the transform is bit-near identical
+			// to what we wrote. Any real camera update by the game moves it far more than this.
+			bool positionUnchanged = (t.position - poseWeWrotePosition_).sqrMagnitude < 1e-10f;
+			bool rotationUnchanged = Quaternion.Angle(t.rotation, poseWeWroteRotation_) < 0.001f;
+
+			if (positionUnchanged && rotationUnchanged) {
+				t.position = gameBasePosition_;
+				t.rotation = gameBaseRotation_;
+				unrefreshedFrames_++;
 			}
 		}
 
@@ -797,6 +852,15 @@ namespace HeadTrackARKit {
 				Quaternion rotOffset = FixLookDirection(state_.GetRotationOffsetEuler());
 
 				Transform t = cam.transform;
+
+				// 0.5.2: undo our own previous offset if the game didn't refresh the camera this frame,
+				// so the additive write can never compound. See RestoreGameBasePoseIfUnrefreshed.
+				RestoreGameBasePoseIfUnrefreshed(t);
+
+				// Whatever the game's pose is right now becomes this frame's base.
+				gameBasePosition_ = t.position;
+				gameBaseRotation_ = t.rotation;
+				hasGameBasePose_ = true;
 
 				// 0.4.0: the car-anchored rig - see the big comment on the anchor fields for why this
 				// replaces the old additive write. Both branches below produce a final pose; the rig
@@ -919,6 +983,11 @@ namespace HeadTrackARKit {
 				// 0.5.0: recorded so OnEndCameraRendering can do a real overwrite check - see there.
 				poseWrittenPosition_ = t.position;
 				poseWrittenThisFrame_ = true;
+
+				// 0.5.2: what we wrote, so next frame can tell whether the game refreshed the camera or
+				// left our value in place. See RestoreGameBasePoseIfUnrefreshed.
+				poseWeWrotePosition_ = t.position;
+				poseWeWroteRotation_ = t.rotation;
 			}
 
 			// 0.3.19 root-caused, 0.3.22 patched with hysteresis, 0.3.25 fixes properly: the
@@ -1182,6 +1251,13 @@ namespace HeadTrackARKit {
 				Kino.Log.Info(
 					$"[HeadTrackARKit][diag] maxRotationOffset={config_.MaxRotationOffset:F2} " +
 					$"rotationSensitivity={config_.RotationSensitivity:F2}");
+				// 0.5.2: how many frames arrived with the camera still holding OUR pose rather than a
+				// freshly-computed one. A non-zero and climbing count confirms CinemachineBrain is
+				// skipping frames (SmartUpdate on a physics-tracked target), which is what used to make
+				// the additive write compound into a shake. Now it just means the base was restored.
+				Kino.Log.Info(
+					$"[HeadTrackARKit][diag] unrefreshedFrames={unrefreshedFrames_} " +
+					$"posSmoothing={config_.PositionSmoothing:F2} rotSmoothing={config_.RotationSmoothing:F2}");
 				// 0.4.0: which camera mode is actually in effect. "rig" means the car-anchored
 				// reconstruction is driving the camera; "additive-fallback" means no car could be
 				// resolved so the old behaviour is in play. If this ever reads additive-fallback

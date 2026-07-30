@@ -50,7 +50,18 @@ namespace HeadTrackARKit.Tracking {
 		public bool IsCalibrated => isCalibrated_;
 		public bool HasSignal => hasRawSample_;
 
-		/// <summary>Feed a freshly-converted (already ARKit->Unity converted) pose sample.</summary>
+		/// <summary>
+		/// Feed a freshly-converted (already ARKit->Unity converted) pose sample.
+		///
+		/// 0.5.2: this used to also advance the smoothing, once per received sample, with a fixed lerp
+		/// factor. That made the effective smoothing depend on the PACKET RATE rather than on time: at a
+		/// high send rate the filter converged almost instantly (no smoothing at all), at a low or
+		/// uneven rate it lagged, and when several packets arrived within one rendered frame the filter
+		/// advanced several times for that single frame. A phone stream whose rate wobbles therefore
+		/// produced a camera whose smoothing wobbled with it - a jitter source of its own. Sampling is
+		/// now decoupled: this stores the newest raw pose only, and <see cref="UpdateSmoothing"/>
+		/// advances the filter exactly once per frame against real elapsed time.
+		/// </summary>
 		public void PushSample(Vector3 unityPosition, Quaternion unityRotation) {
 			rawPosition_ = unityPosition;
 			rawRotation_ = unityRotation;
@@ -60,11 +71,27 @@ namespace HeadTrackARKit.Tracking {
 				smoothedPosition_ = unityPosition;
 				smoothedRotation_ = unityRotation;
 				hasSmoothedSample_ = true;
-				return;
 			}
+		}
 
-			smoothedPosition_ = Vector3.Lerp(smoothedPosition_, unityPosition, Mathf.Clamp01(PositionSmoothing));
-			smoothedRotation_ = Quaternion.Slerp(smoothedRotation_, unityRotation, Mathf.Clamp01(RotationSmoothing));
+		/// <summary>
+		/// Advances the smoothing filter toward the newest raw sample. Call once per frame with the
+		/// frame's unscaled delta time.
+		///
+		/// Exponential, frame-rate independent: PositionSmoothing/RotationSmoothing are "fraction of the
+		/// remaining error closed per 1/60 s", scaled by the real frame time - the same formulation the
+		/// zoom easing already used. Identical response at 30, 60 or 144 fps, and unaffected by how many
+		/// OSC packets happen to land in a given frame.
+		/// </summary>
+		public void UpdateSmoothing(float deltaTime) {
+			if (!hasRawSample_ || !hasSmoothedSample_) return;
+			if (deltaTime <= 0f) return;
+
+			float posRate = 1f - Mathf.Pow(1f - Mathf.Clamp01(PositionSmoothing), deltaTime * 60f);
+			float rotRate = 1f - Mathf.Pow(1f - Mathf.Clamp01(RotationSmoothing), deltaTime * 60f);
+
+			smoothedPosition_ = Vector3.Lerp(smoothedPosition_, rawPosition_, posRate);
+			smoothedRotation_ = Quaternion.Slerp(smoothedRotation_, rawRotation_, rotRate);
 		}
 
 		/// <summary>Set the current smoothed pose as the "looking at the screen normally" baseline.</summary>

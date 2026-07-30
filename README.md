@@ -9,6 +9,66 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.5.2** - Fixes the back-and-forth shake while driving. Two independent causes, both real bugs.
+
+### 1. The additive write was compounding
+
+The pose write is additive — `t.position += t.rotation * posOffset` — which assumes something restores
+the camera to the game's own pose every rendered frame. **That assumption is false.** Cinemachine's own
+metadata says so: `CinemachineBrain` has `m_UpdateMethod` (FixedUpdate / LateUpdate / **SmartUpdate** /
+ManualUpdate), `m_BlendUpdateMethod`, and decisively `m_LastFrameUpdated` + `mWaitForFixedUpdate`,
+alongside `CinemachineCore.GetVcamUpdateStatus` / `GetUpdateTarget`. The Brain deliberately tracks which
+frame it last pushed a pose and **skips frames**; under `SmartUpdate` a physics-tracked target is driven
+at the *fixed* timestep, so at any framerate above it some render frames get no fresh pose.
+
+On those frames the offset was added on top of a transform that already contained the previous frame's
+offset. The camera crept outward, the next Brain write snapped it back, and the cycle repeated — a shake
+that only appears while driving, because that is when the physics/render mismatch and the camera's own
+motion are both live. Latent since 0.3.8; invisible until 0.5.0 made the write reach the screen.
+
+Fixed by making the write **idempotent**: the pose the game handed us and the pose we wrote are both
+remembered, and if the transform still reads back as ours, the game's pose is restored before applying
+this frame's offset. When the game *does* refresh, its new value is the base exactly as before, so
+genuine additive behaviour and CarX's sway/follow are preserved.
+
+### 2. Smoothing depended on packet rate, not time
+
+`PushSample` advanced the filter once per received OSC packet with a fixed lerp factor. So the response
+depended on how many packets arrived, not on elapsed time: fast stream → almost no smoothing, slow or
+uneven stream → lag, several packets in one frame → the filter advanced several times for that frame. A
+stream whose rate wobbles produced smoothing that wobbled with it.
+
+Split into `PushSample` (stores the newest raw pose only) and `HeadTrackState.UpdateSmoothing(dt)`,
+called exactly once per frame from `onBeforeRender` with real elapsed time, using the same
+frame-rate-independent exponential form the zoom easing already used.
+
+### Verification (`tools/jitter_proof.py`)
+
+Physics 50 Hz, render 144 Hz (2.9 render frames per physics step), steady 0.25 m offset, game pose held
+still to isolate the artefact:
+
+| | Offset range | Worst frame-to-frame jump |
+|---|---|---|
+| Before | 0.25 → 0.75 m (**0.50 m of oscillation**) | **0.50 m** |
+| After | 0.25 → 0.25 m (0.00e+00) | 0.00e+00 |
+
+Smoothing response 100 ms after a step input (a 1 s window hides this — everything has converged by
+then):
+
+| Packet rate | Before | After |
+|---|---|---|
+| 10 Hz | 0.3500 | 0.9190 |
+| 30 Hz | 0.7254 | 0.9190 |
+| 60 Hz | 0.9246 | 0.9190 |
+| 120 Hz | 0.9943 | 0.9190 |
+
+Response varied by **0.644** across packet rates before; **0.00e+00** after. Also frame-rate independent
+(30/60/144 fps → 0.9246/0.9246/0.9190). 3/3 pass; the earlier 9 geometry, 3 regression, 3 orbit-clamp
+and 3 frame-order checks still pass.
+
+A new heartbeat line reports `unrefreshedFrames=` — the count of frames that arrived still holding our
+pose. Non-zero and climbing confirms the Brain is skipping frames; it is now harmless.
+
 **0.5.1** - Camera now holds its position and turns, instead of sliding sideways.
 
 With 0.5.0 finally putting the pose write where HDRP reads it, two settings that existed purely to
