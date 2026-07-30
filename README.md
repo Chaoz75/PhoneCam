@@ -9,6 +9,53 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.6.2** - A physics-rate staircase I introduced in 0.5.4, plus stronger default filtering.
+
+### 1. The offset frame was sampling a physics-driven transform
+
+0.5.4 moved the offset frame onto the **car's** transform, which fixed the sway coupling but created a
+new problem: the car is physics-driven, so its transform advances at the **fixed timestep**, not the
+render rate. Sampling `car.forward` once per rendered frame reads a staircase whenever the render rate
+is higher — the heading holds for a frame or two, then jumps, and the tracked offset inherits the steps.
+Car-motion-dependent by construction: parked, the heading is constant and nothing steps.
+
+Consistent with the live 0.6.1 capture: per-frame camera step **stdev was 34% of the mean**, and
+step-size autocorrelation peaked at **lag 2 (+0.325) above lag 1 (+0.141)** — a two-frame beat, not
+smooth motion.
+
+Simulated at 144 Hz render / 50 Hz physics with the phone perfectly still:
+
+| | Step variation | Frames where the offset didn't move at all |
+|---|---|---|
+| Raw `car.forward` (0.5.4–0.6.1) | **137%** | **65%** |
+| Low-passed heading (0.6.2) | 14.5% | 0% |
+
+Time constant chosen by sweep rather than guess — 0 ms leaves 137%, 25 ms gives 23.5%, 50 ms gives
+14.5%, and it flattens after that while heading lag keeps growing (3° at 50 ms and 60°/s of turn, 12° at
+200 ms). **50 ms is the knee.**
+
+**Honest scale check:** in absolute terms this staircase is worth about **0.13 mm** of camera movement.
+It is a real defect and worth fixing, but it is almost certainly not the shake being seen.
+
+### 2. Stronger default filtering — the lever that actually matters
+
+The residual tracking jitter is small in absolute terms, but HDRP's temporal AA resolves sub-pixel
+camera movement *by design*, so hundredths of a degree of camera wobble surface as visible shimmer once
+the scene is streaming past at speed. That is why it reads as "only when the car moves".
+
+`FilterMinCutoffHz` retuned 1.0 Hz → **0.4 Hz** (one-time, `FilterRetunedForShimmer`):
+
+| MinCutoff | Resting jitter (mean/frame) | Max |
+|---|---|---|
+| 1.00 Hz | 0.0132° | 0.0630° |
+| **0.40 Hz** | **0.0083°** | **0.0405°** |
+| 0.25 Hz | 0.0070° | 0.0349° |
+
+The speed-adaptive term still opens the filter for deliberate movement, so responsiveness is preserved.
+If shimmer persists, **Steadiness at rest** goes down to 0.2 Hz in the panel — that is the control.
+
+11/11 harnesses pass.
+
 **0.6.1** - The direction-dependent shake: an `atan2` singularity in the yaw extraction. This is why
 it was smooth looking straight ahead and violent in particular directions.
 

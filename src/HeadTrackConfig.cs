@@ -169,6 +169,14 @@ namespace HeadTrackARKit {
 		/// <summary>One-time migration turning the adaptive filter on for existing installs.</summary>
 		bool AdaptiveFilterDefaulted { get; set; }
 
+		/// <summary>
+		/// One-time retune of <see cref="FilterMinCutoffHz"/> from 1.0 Hz to 0.4 Hz. The residual
+		/// jitter at 1.0 Hz is small in absolute terms, but HDRP's temporal AA resolves sub-pixel
+		/// camera movement by design, so hundredths of a degree of wobble surface as visible shimmer
+		/// once the scene is moving past at speed.
+		/// </summary>
+		bool FilterRetunedForShimmer { get; set; }
+
 		// --- Privacy ---
 
 		/// <summary>

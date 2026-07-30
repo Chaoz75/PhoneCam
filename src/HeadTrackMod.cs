@@ -22,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.6.1", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.6.2", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.6.1";
+		private const string CurrentVersion = "0.6.2";
 
 		private const int DefaultOscPort = 9000;
 
@@ -104,6 +104,14 @@ namespace HeadTrackARKit {
 		// instead of snapping it off in a single frame. See the fade block in ApplyTrackingToCamera.
 		private float signalConfidence_;
 		private const float SignalFadeSeconds = 0.35f;
+
+		// 0.6.2: low-passed heading for the offset frame - see GetSmoothedFrameYaw. Swept 0-200 ms
+		// against a simulated 50 Hz staircase: 0 ms leaves 137% step variation, 25 ms gives 23.5%,
+		// 50 ms gives 14.5%, and past that it flattens out while the heading lag keeps growing
+		// (3 deg at 50 ms and 60 deg/s of turn, 12 deg at 200 ms). 50 ms is the knee.
+		private float frameYaw_;
+		private bool hasFrameYaw_;
+		private const float FrameYawTimeConstant = 0.050f;
 
 		// 0.4.6: bounds on the orbit arc - see the clamp in OnCameraPreCull for the measured reason.
 		// Yaw gets a usable arc; pitch stays small because pitch is what swings the camera under the car.
@@ -843,6 +851,45 @@ namespace HeadTrackARKit {
 		}
 
 		private Quaternion GetStableOffsetFrame(Transform cameraTransform) {
+			return Quaternion.AngleAxis(GetSmoothedFrameYaw(cameraTransform), Vector3.up);
+		}
+
+		/// <summary>
+		/// 0.6.2: the offset frame's heading, low-passed.
+		///
+		/// 0.5.4 moved the offset frame onto the CAR's transform, which fixed the sway coupling but
+		/// introduced a new problem: the car is physics-driven, so its transform advances at the FIXED
+		/// timestep, not the render rate. Sampling <c>car.forward</c> once per rendered frame therefore
+		/// reads a staircase whenever the render rate is above the physics rate - the heading holds for
+		/// a frame or two, then jumps. Because the tracked offset is rotated by that frame, the offset
+		/// direction inherits the steps, and the camera advances unevenly. That is car-motion-dependent
+		/// by construction: parked, the heading is constant and there is nothing to step.
+		///
+		/// A live 0.6.1 capture is consistent with this - per-frame camera step size had a standard
+		/// deviation of 34% of its mean, and the step-size autocorrelation peaked at lag 2 (+0.325)
+		/// ABOVE lag 1 (+0.141), which is a two-frame periodic beat rather than smooth motion.
+		///
+		/// The frame only needs to answer "which way is left", so a few milliseconds of lag on it is
+		/// imperceptible, while low-passing removes the stepping regardless of whether the car's
+		/// Rigidbody has interpolation enabled.
+		/// </summary>
+		private float GetSmoothedFrameYaw(Transform cameraTransform) {
+			float targetYaw = GetRawFrameYaw(cameraTransform);
+
+			if (!hasFrameYaw_) {
+				frameYaw_ = targetYaw;
+				hasFrameYaw_ = true;
+				return frameYaw_;
+			}
+
+			// Frame-rate independent exponential smoothing, through the shortest arc so it behaves
+			// correctly across the +-180 seam.
+			float rate = 1f - Mathf.Exp(-Time.unscaledDeltaTime / Mathf.Max(0.001f, FrameYawTimeConstant));
+			frameYaw_ += Mathf.DeltaAngle(frameYaw_, targetYaw) * rate;
+			return frameYaw_;
+		}
+
+		private float GetRawFrameYaw(Transform cameraTransform) {
 			Transform car = GetCarTransform();
 
 			Vector3 forward = car != null ? car.forward : cameraTransform.forward;
@@ -853,10 +900,10 @@ namespace HeadTrackARKit {
 			if (flat.sqrMagnitude < 1e-6f) {
 				Vector3 right = car != null ? car.right : cameraTransform.right;
 				flat = new Vector3(right.z, 0f, -right.x);
-				if (flat.sqrMagnitude < 1e-6f) return Quaternion.identity;
+				if (flat.sqrMagnitude < 1e-6f) return hasFrameYaw_ ? frameYaw_ : 0f;
 			}
 
-			return Quaternion.LookRotation(flat.normalized, Vector3.up);
+			return Mathf.Atan2(flat.x, flat.z) * Mathf.Rad2Deg;
 		}
 
 		private void ApplyTrackingToCamera(Camera cam) {
@@ -2053,7 +2100,17 @@ namespace HeadTrackARKit {
 				config_.AdaptiveFilterEnabled = true;
 				config_.AdaptiveFilterDefaulted = true;
 			}
-			if (config_.FilterMinCutoffHz <= 0) config_.FilterMinCutoffHz = 1.0f;
+			if (config_.FilterMinCutoffHz <= 0) config_.FilterMinCutoffHz = 0.4f;
+
+			// 0.6.2: 1.0 Hz still passed visible noise. The residual jitter is small in absolute terms
+			// but HDRP's temporal AA resolves sub-pixel camera movement by design, so a few hundredths
+			// of a degree of camera wobble becomes visible shimmer once the scene is moving past at
+			// speed - which is why it reads as "only when the car moves". 0.4 Hz roughly 2.5x's the
+			// filtering at rest, and the speed-adaptive term still opens it up for real movement.
+			if (!config_.FilterRetunedForShimmer) {
+				config_.FilterMinCutoffHz = 0.4f;
+				config_.FilterRetunedForShimmer = true;
+			}
 			if (config_.FilterSpeedCoefficient <= 0) config_.FilterSpeedCoefficient = 0.02f;
 
 			if (!config_.PositionInvertDefaulted) {
