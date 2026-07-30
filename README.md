@@ -9,6 +9,46 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.6.4** - Per-frame disk logging removed from the render hot path, and a self-triggering diagnostic
+fixed. Both found by reading the log the user just produced.
+
+### What the 0.6.3 log showed
+
+| | |
+|---|---|
+| Total lines | 8,680 |
+| **PhoneCam lines** | **7,252 — 84% of the entire game log** |
+| `endOfRender` (one per frame per camera) | 3,307 |
+| `OVERWRITTEN` warnings | **2,923** |
+| Log size | 1.8 MB in a few minutes |
+
+### 1. The `OVERWRITTEN` warnings were self-inflicted
+
+0.6.3 added the post-render revert, but placed it **before** the 0.5.0 drift check in
+`OnEndCameraRendering`. So the check measured our own revert and reported it as an external overwrite —
+all 2,923 of them, one per frame. The check now runs before the revert.
+
+### 2. `endOfRender` logged every frame, since 0.3.21
+
+That block ran unconditionally, once per frame per camera, formatting four `Vector3`s (now at `F4`, so
+long strings) and writing to disk. At 144 fps that is roughly **144 synchronous log writes per second on
+the render thread**. Per-frame disk I/O at that rate produces frame-time spikes — and a spike is far
+more visible when the whole scene is streaming past at speed than when parked, which matches "only when
+I'm driving".
+
+Now gated behind a new **Verbose per-frame logging** toggle (off by default) and rate-limited to one
+sample every 2 s even when enabled. Measured against the real session: **6,230 hot-path writes → 0**.
+
+Everything else that logs is event-driven (`Calibrate`, `StartReceiver`, toggles) or already rate-limited
+(the 2 s heartbeat, `LogCameraOwnership`'s once-per-camera dump, the edge-triggered OSC signal
+warnings), so the hot path is now clean.
+
+**Caveat, stated plainly:** this is a genuine performance defect and the timing fits the symptom, but
+frame-time spikes were not directly measured — the mechanism is inferred from the write rate. If jitter
+persists with verbose logging off, the remaining suspect is elsewhere.
+
+12/12 harnesses pass.
+
 **0.6.3** - The offset was being fed back into CarX's own camera damper. This is why it shook only
 while the car moved.
 

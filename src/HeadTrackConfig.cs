@@ -177,6 +177,18 @@ namespace HeadTrackARKit {
 		/// </summary>
 		bool FilterRetunedForShimmer { get; set; }
 
+		/// <summary>
+		/// Verbose per-frame diagnostics (end-of-render camera pose, overwrite detection). OFF by
+		/// default as of 0.6.4.
+		///
+		/// These ran unconditionally every frame from 0.3.21 onward. A real 0.6.3 session logged 7,252
+		/// PhoneCam lines - 84% of the entire game log, 1.8 MB in minutes - at roughly 144 synchronous
+		/// writes per second. That is frame-time spikes on the render hot path, and spikes read as
+		/// judder far more readily when the scene is moving fast. They served their purpose during
+		/// debugging and should not run during normal play.
+		/// </summary>
+		bool VerboseDiagnostics { get; set; }
+
 		// --- Privacy ---
 
 		/// <summary>

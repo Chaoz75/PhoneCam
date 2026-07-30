@@ -22,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.6.3", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.6.4", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.6.3";
+		private const string CurrentVersion = "0.6.4";
 
 		private const int DefaultOscPort = 9000;
 
@@ -94,6 +94,10 @@ namespace HeadTrackARKit {
 		// one after it has drawn - see the comment there for why reverting matters.
 		private Camera poseAppliedCamera_;
 		private bool poseAppliedThisFrame_;
+
+		// 0.6.4: see ShouldLogVerbose - keeps the formerly per-frame diagnostics off the hot path.
+		private float lastVerboseLogTime_;
+		private const float VerboseLogIntervalSeconds = 2f;
 
 		// 0.5.3: same idempotency pair for the zoom/FOV write.
 		private float gameBaseFov_;
@@ -1313,29 +1317,31 @@ namespace HeadTrackARKit {
 		private void OnEndCameraRendering(ScriptableRenderContext context, Camera cam) {
 			if (!config_.Enabled || cam == null || cam.targetTexture != null || cam.orthographic) return;
 
-			// 0.6.3 - THE CAR-MOTION JITTER. Undo our offset now that the frame is drawn.
+			// 0.6.4: the drift check has to happen BEFORE the revert below, otherwise it measures our
+			// own revert and reports it as an external overwrite. It did exactly that - a real log
+			// carried 2,923 self-inflicted OVERWRITTEN warnings, one per frame, which was both
+			// meaningless and a large part of the logging load described below.
+			if (config_.VerboseDiagnostics && poseWrittenThisFrame_) {
+				float drift = (cam.transform.position - poseWrittenPosition_).magnitude;
+				if (drift > 0.01f && ShouldLogVerbose()) {
+					Kino.Log.Warning(
+						$"[HeadTrackARKit][diag] OVERWRITTEN: wrote {FormatVector(poseWrittenPosition_)} in " +
+						$"onBeforeRender, but cam='{cam.name}' reads {FormatVector(cam.transform.position)} at " +
+						$"end of render ({drift:F2} m) - something else is writing this camera.");
+				}
+			}
+
+			// 0.6.3 - undo our offset now that the frame is drawn.
 			//
 			// CarX's chase camera is a STATEFUL DAMPED FOLLOW that reads the camera's live transform as
-			// its own input. From Assembly-CSharp, CarX.FollowCamera.LateUpdate calls, in order:
-			//     Transform::get_position  (x3)   <- reads where the camera currently IS
-			//     Vector3::Lerp                   <- damps from that toward its target
-			//     Transform::get_forward -> Quaternion::LookRotation -> Transform::set_rotation
+			// its own input. From Assembly-CSharp, CarX.FollowCamera.LateUpdate calls:
+			//     Transform::get_position (x3), Vector3::Lerp,
+			//     Transform::get_forward -> Quaternion::LookRotation -> Transform::set_rotation,
 			//     Transform::Rotate, Mathf::MoveTowards
-			//
-			// Leaving our offset on the transform therefore feeds it straight back into the game's own
-			// damper: next frame it Lerps starting from our offset pose, partially corrects toward its
-			// target, and we add the offset again on top - a closed loop that oscillates. Critically,
-			// the loop only has gain while the damper is actually working, which is exactly when the
-			// car is moving. Parked, its target already equals its current pose, the Lerp is a no-op,
-			// and the same constant offset just sits there harmlessly. That is precisely the reported
-			// "smooth when the car is still, shakes as soon as it moves", and it is why none of the
-			// filtering or frame-of-reference work touched it - the offset was never the problem, the
-			// feedback path was.
-			//
-			// Restoring the game's own pose immediately after the frame is drawn breaks the loop: the
-			// game's camera logic always starts each frame from its own clean state and never observes
-			// this mod at all, while the rendered image still contains the offset. This is the standard
-			// late-latch pattern (apply late, revert immediately after render).
+			// and CalcCameraPoint picks its tracking point by SqrMagnitude distance FROM THE CAMERA'S
+			// POSITION, hard-resetting via Reset()/InstantApplyFocus() when the choice flips. Leaving
+			// our offset on the transform fed all of that back into itself. Reverting here means the
+			// rendered image keeps the offset while the game's camera logic never observes it.
 			if (poseAppliedThisFrame_ && ReferenceEquals(cam, poseAppliedCamera_)) {
 				Transform t = cam.transform;
 				t.position = gameBasePosition_;
@@ -1344,43 +1350,21 @@ namespace HeadTrackARKit {
 				poseAppliedThisFrame_ = false;
 			}
 
-			// 0.5.0: the honest version of this check.
+			// 0.6.4 - PER-FRAME LOGGING REMOVED FROM THE HOT PATH.
 			//
-			// Comparing transform.position against worldToCameraMatrix was circular: with no explicit
-			// matrix override set, Unity DERIVES worldToCameraMatrix from the Transform on demand, so
-			// the two agreed trivially every time and the check could never have detected the actual
-			// problem (HDRP having already snapshotted its own copy before we wrote anything). It is
-			// kept below only to detect an explicit matrix reassignment by something else.
+			// This block used to log unconditionally, once per frame per camera, since 0.3.21. A real
+			// 0.6.3 session produced 7,252 PhoneCam lines - 84% of the entire game log, 1.8 MB in a few
+			// minutes - of which 3,307 were this line and 2,923 were the self-triggered warning above.
+			// At 144 fps that is ~144 synchronous log writes per second, each formatting four Vector3s
+			// (at F4, so long strings). Per-frame disk I/O of that volume produces frame-time spikes,
+			// and a spike is far more visible when the whole scene is streaming past at speed than when
+			// parked - which matches "only when I'm driving" exactly.
 			//
-			// The meaningful comparison is against the pose WE wrote in Application.onBeforeRender
-			// earlier this frame. That value is separated from this read by the entire render, so a
-			// mismatch means something genuinely overwrote the camera in between - which is the
-			// question this diagnostic was always supposed to answer.
+			// It is now gated behind VerboseDiagnostics (off by default) and rate-limited even then.
+			if (!config_.VerboseDiagnostics || !ShouldLogVerbose()) return;
+
 			Vector3 transformPos = cam.transform.position;
 			Vector3 matrixDecodedPos = cam.worldToCameraMatrix.inverse.MultiplyPoint3x4(Vector3.zero);
-
-			if (poseWrittenThisFrame_) {
-				float drift = (transformPos - poseWrittenPosition_).magnitude;
-				if (drift > 0.01f) {
-					Kino.Log.Warning(
-						$"[HeadTrackARKit][diag] OVERWRITTEN: wrote {FormatVector(poseWrittenPosition_)} in " +
-						$"onBeforeRender, but cam='{cam.name}' reads {FormatVector(transformPos)} at end of " +
-						$"render ({drift:F2} m of drift) - something else is writing this camera.");
-				}
-			}
-
-			// 0.3.29: this diagnostic has proven position survives to the final render, every time
-			// it's been checked, across dozens of logs - but it has never once checked ROTATION the
-			// same way, and "I can move the camera left/right/up/down and nothing happens" has been
-			// the single most consistently repeated complaint this whole project, distinct from the
-			// (separately, repeatedly proven) OSC dropout pattern. It's entirely possible for
-			// position to ride through untouched while something else - e.g. a chase-cam look-at
-			// correction that itself runs at the onPreCull/beginCameraRendering stage, after this
-			// mod's own resubscribe-to-the-end trick - reasserts the camera's ORIENTATION only,
-			// leaving position alone. Nothing in this mod has ever been able to tell those two cases
-			// apart until now. Same technique as the position check: decode the camera's actual
-			// forward direction directly out of the matrix that was really used to render this
-			// frame, independent of the Transform, and compare against transform.forward.
 			Vector3 transformForward = cam.transform.forward;
 			Vector3 matrixDecodedForward = cam.worldToCameraMatrix.inverse.MultiplyVector(new Vector3(0f, 0f, -1f)).normalized;
 
@@ -1388,6 +1372,17 @@ namespace HeadTrackARKit {
 				$"[HeadTrackARKit][diag] endOfRender cam='{cam.name}' transformPos={FormatVector(transformPos)} matrixDecodedPos={FormatVector(matrixDecodedPos)} " +
 				$"transformFwd={FormatVector(transformForward)} matrixDecodedFwd={FormatVector(matrixDecodedForward)}");
 		}
+
+		/// <summary>
+		/// 0.6.4: rate limiter for the verbose per-frame diagnostics, so even with them enabled the log
+		/// gets one sample every couple of seconds rather than one per frame.
+		/// </summary>
+		private bool ShouldLogVerbose() {
+			if (Time.unscaledTime - lastVerboseLogTime_ < VerboseLogIntervalSeconds) return false;
+			lastVerboseLogTime_ = Time.unscaledTime;
+			return true;
+		}
+
 
 		/// <summary>
 		/// Raycasts from <paramref name="originPosition"/>/<paramref name="originRotation"/> -
@@ -2347,6 +2342,12 @@ namespace HeadTrackARKit {
 			Kino.UI.HorizontalLine();
 			Kino.UI.GroupLabel("Look direction");
 			Kino.UI.Label("If up/down or left/right ever feels backwards or reversed, flip it here.");
+
+			bool verbose = config_.VerboseDiagnostics;
+			if (Kino.UI.Toggle("Verbose per-frame logging (slow - debugging only)", ref verbose)) {
+				config_.VerboseDiagnostics = verbose;
+				Kino.Log.Info($"[HeadTrackARKit] Verbose diagnostics {(verbose ? "ON" : "OFF")}.");
+			}
 
 			Kino.UI.GroupLabel("Jitter filter");
 			bool adaptive = config_.AdaptiveFilterEnabled;
