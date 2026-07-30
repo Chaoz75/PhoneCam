@@ -781,6 +781,75 @@ namespace HeadTrackARKit {
 		}
 
 		/// <summary>
+		/// 0.5.4: per-axis flip for the tracked translation. Rotation has had InvertPitch/InvertYaw
+		/// since 0.3.13, but translation had no equivalent, so a reversed left/right mapping (phone
+		/// left, camera right) could not be corrected from the settings panel at all. Applied after
+		/// GetPositionOffset, i.e. in the calibration-yaw frame, so X is straightforwardly
+		/// "left/right as you were facing when you pressed F9".
+		/// </summary>
+		private Vector3 ApplyPositionInvert(Vector3 offset) {
+			if (config_.InvertPositionX) offset.x = -offset.x;
+			if (config_.InvertPositionY) offset.y = -offset.y;
+			if (config_.InvertPositionZ) offset.z = -offset.z;
+			return offset;
+		}
+
+		/// <summary>
+		/// 0.5.4: a steady frame to express the tracked translation and rotation in.
+		///
+		/// The camera's own live rotation is the wrong choice: CarX.FollowCamera pitches and rolls it
+		/// (sway) and yaws it hard to follow a drift, so a constant phone offset rotated by it sweeps
+		/// around and the camera wobbles even with the phone perfectly still. The car's heading carries
+		/// none of that. Yaw-only in both cases, so camera pitch/roll can never tip a sideways lean into
+		/// a vertical one - the same class of bug 0.3.16 fixed for the calibration frame.
+		/// </summary>
+		private Quaternion GetStableOffsetFrame(Transform cameraTransform) {
+			return Quaternion.AngleAxis(GetSmoothedFrameYaw(cameraTransform), Vector3.up);
+		}
+
+		/// <summary>
+		/// 0.6.2: the offset frame's heading, low-passed.
+		///
+		/// The car is physics-driven, so its transform advances at the FIXED timestep. Sampling
+		/// car.forward once per rendered frame reads a staircase whenever the render rate is higher -
+		/// the heading holds for a frame or two, then jumps, and the offset direction inherits the
+		/// steps. Simulated at 144 Hz render / 50 Hz physics that is 137% step-size variation with 65%
+		/// of frames frozen; a 50 ms time constant brings it to 14.5% with 3 degrees of heading lag at
+		/// 60 deg/s of turn, which is the knee of the curve.
+		/// </summary>
+		private float GetSmoothedFrameYaw(Transform cameraTransform) {
+			float targetYaw = GetRawFrameYaw(cameraTransform);
+
+			if (!hasFrameYaw_) {
+				frameYaw_ = targetYaw;
+				hasFrameYaw_ = true;
+				return frameYaw_;
+			}
+
+			// Frame-rate independent, through the shortest arc so it behaves across the +-180 seam.
+			float rate = 1f - Mathf.Exp(-Time.unscaledDeltaTime / Mathf.Max(0.001f, FrameYawTimeConstant));
+			frameYaw_ += Mathf.DeltaAngle(frameYaw_, targetYaw) * rate;
+			return frameYaw_;
+		}
+
+		private float GetRawFrameYaw(Transform cameraTransform) {
+			Transform car = GetCarTransform();
+
+			Vector3 forward = car != null ? car.forward : cameraTransform.forward;
+
+			// Flatten to the horizontal plane. Degenerate only if looking exactly straight up or down,
+			// in which case fall back to the transform's own flattened right vector for a stable basis.
+			Vector3 flat = new Vector3(forward.x, 0f, forward.z);
+			if (flat.sqrMagnitude < 1e-6f) {
+				Vector3 right = car != null ? car.right : cameraTransform.right;
+				flat = new Vector3(right.z, 0f, -right.x);
+				if (flat.sqrMagnitude < 1e-6f) return hasFrameYaw_ ? frameYaw_ : 0f;
+			}
+
+			return Mathf.Atan2(flat.x, flat.z) * Mathf.Rad2Deg;
+		}
+
+		/// <summary>
 		/// 0.7.0 - THE ARCHITECTURAL FIX. The camera's Transform is never written; only its view matrix.
 		///
 		/// Every defect in this project's history traces to one decision: writing <c>cam.transform</c>,
