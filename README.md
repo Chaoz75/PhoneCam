@@ -9,6 +9,71 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.6.3** - The offset was being fed back into CarX's own camera damper. This is why it shook only
+while the car moved.
+
+### The clue that cracked it
+
+"No shake when the car is still; shakes as soon as it moves." That rules out everything the previous
+several versions addressed — phone noise, filter tuning, the yaw singularity, the offset frame — because
+all of those would shake while parked too. **The disturbance is a function of the car's motion, not the
+phone's signal.**
+
+### Cause, from CarX's own IL
+
+`CarX.FollowCamera.LateUpdate` is a **stateful damped follow that reads the camera's live transform as
+its own input**:
+
+```
+Transform::get_position  (x3)     <- reads where the camera currently IS
+Vector3::Lerp                     <- damps from that toward its target
+Transform::get_forward -> Quaternion::LookRotation -> Transform::set_rotation
+Transform::Rotate, Mathf::MoveTowards
+```
+
+Leaving our offset on the transform fed it straight back in. Each frame it damped *from* our offset
+pose, partially corrected, and we added the offset again — a closed loop. Modelled, that loop turns a
+**30 cm** request into **90 cm** of camera displacement: a **3× amplification** caused purely by the
+game re-reading its own polluted output.
+
+The jitter specifically comes from `FollowCamera.CalcCameraPoint`:
+
+```
+Transform::get_position                    <- the CAMERA's position
+Vector3::op_Subtraction -> SqrMagnitude    <- distance to tracking point A
+Vector3::op_Subtraction -> SqrMagnitude    <- distance to tracking point B
+...compare, then Transform::set_position
+this::Reset
+this::InstantApplyFocus                    <- a hard SNAP, not a blend
+```
+
+It selects the nearest tracking point **by distance from the camera's position** — exactly the quantity
+our offset was displacing — and on a switch it hard-resets. Parked, those distances are static so the
+choice is stable; moving, they sweep past each other continuously. Hence motion-dependent.
+
+### Fix
+
+Revert the camera to the game's own pose in `OnEndCameraRendering`, immediately after the frame is
+drawn. The rendered image still contains the offset; the game's camera logic starts every frame from its
+own clean state and never observes this mod at all. This is the standard late-latch pattern — apply
+late, revert straight after render.
+
+### Verification (`tools/feedback_loop_proof.py`)
+
+| | Camera displacement from a 30 cm request | Deviation from the clean no-mod trajectory |
+|---|---|---|
+| ≤0.6.2 (offset left on the transform) | **90 cm (3×)** | 90.00 cm |
+| 0.6.3 (reverted after render) | 30 cm (1×) | **0.00 cm** |
+
+**What this model does not show:** the jitter itself. A linear damper answers a constant offset with a
+constant bias by superposition, so the oscillation must come from the discrete machinery above
+(`CalcCameraPoint` switching, `Mathf.MoveTowards`, `LookRotation`), which cannot be faithfully simulated
+without the real tracking-point layout and thresholds. An attempt to model the switching produced zero
+switches in every condition — demonstrating nothing — and was removed rather than dressed up. The
+amplification result is real and proven; the switching mechanism rests on the IL evidence.
+
+12/12 harnesses pass.
+
 **0.6.2** - A physics-rate staircase I introduced in 0.5.4, plus stronger default filtering.
 
 ### 1. The offset frame was sampling a physics-driven transform

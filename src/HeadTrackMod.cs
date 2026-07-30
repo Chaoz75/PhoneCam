@@ -22,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.6.2", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.6.3", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.6.2";
+		private const string CurrentVersion = "0.6.3";
 
 		private const int DefaultOscPort = 9000;
 
@@ -89,6 +89,11 @@ namespace HeadTrackARKit {
 		private Quaternion poseWeWroteRotation_ = Quaternion.identity;
 		private bool hasGameBasePose_;
 		private int unrefreshedFrames_;
+
+		// 0.6.3: which camera got the offset this frame, so OnEndCameraRendering reverts exactly that
+		// one after it has drawn - see the comment there for why reverting matters.
+		private Camera poseAppliedCamera_;
+		private bool poseAppliedThisFrame_;
 
 		// 0.5.3: same idempotency pair for the zoom/FOV write.
 		private float gameBaseFov_;
@@ -1183,6 +1188,10 @@ namespace HeadTrackARKit {
 				// left our value in place. See RestoreGameBasePoseIfUnrefreshed.
 				poseWeWrotePosition_ = t.position;
 				poseWeWroteRotation_ = t.rotation;
+
+				// 0.6.3: mark for the post-render revert in OnEndCameraRendering.
+				poseAppliedCamera_ = cam;
+				poseAppliedThisFrame_ = true;
 			}
 
 			// 0.3.19 root-caused, 0.3.22 patched with hysteresis, 0.3.25 fixes properly: the
@@ -1303,6 +1312,37 @@ namespace HeadTrackARKit {
 		/// </summary>
 		private void OnEndCameraRendering(ScriptableRenderContext context, Camera cam) {
 			if (!config_.Enabled || cam == null || cam.targetTexture != null || cam.orthographic) return;
+
+			// 0.6.3 - THE CAR-MOTION JITTER. Undo our offset now that the frame is drawn.
+			//
+			// CarX's chase camera is a STATEFUL DAMPED FOLLOW that reads the camera's live transform as
+			// its own input. From Assembly-CSharp, CarX.FollowCamera.LateUpdate calls, in order:
+			//     Transform::get_position  (x3)   <- reads where the camera currently IS
+			//     Vector3::Lerp                   <- damps from that toward its target
+			//     Transform::get_forward -> Quaternion::LookRotation -> Transform::set_rotation
+			//     Transform::Rotate, Mathf::MoveTowards
+			//
+			// Leaving our offset on the transform therefore feeds it straight back into the game's own
+			// damper: next frame it Lerps starting from our offset pose, partially corrects toward its
+			// target, and we add the offset again on top - a closed loop that oscillates. Critically,
+			// the loop only has gain while the damper is actually working, which is exactly when the
+			// car is moving. Parked, its target already equals its current pose, the Lerp is a no-op,
+			// and the same constant offset just sits there harmlessly. That is precisely the reported
+			// "smooth when the car is still, shakes as soon as it moves", and it is why none of the
+			// filtering or frame-of-reference work touched it - the offset was never the problem, the
+			// feedback path was.
+			//
+			// Restoring the game's own pose immediately after the frame is drawn breaks the loop: the
+			// game's camera logic always starts each frame from its own clean state and never observes
+			// this mod at all, while the rendered image still contains the offset. This is the standard
+			// late-latch pattern (apply late, revert immediately after render).
+			if (poseAppliedThisFrame_ && ReferenceEquals(cam, poseAppliedCamera_)) {
+				Transform t = cam.transform;
+				t.position = gameBasePosition_;
+				t.rotation = gameBaseRotation_;
+				if (hasGameBaseFov_) cam.fieldOfView = gameBaseFov_;
+				poseAppliedThisFrame_ = false;
+			}
 
 			// 0.5.0: the honest version of this check.
 			//
