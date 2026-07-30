@@ -22,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.4.1", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.4.2", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.4.1";
+		private const string CurrentVersion = "0.4.2";
 
 		private const int DefaultOscPort = 9000;
 
@@ -62,6 +62,13 @@ namespace HeadTrackARKit {
 		// tracking itself being broken.
 		private Vector3 lastRawArPosition_;
 		private Vector3 lastAppliedPosOffset_;
+
+		// 0.4.2: see TrackPositionalSignalRange - running min/max of the raw ARKit position, used to
+		// state plainly whether the phone is sending real positional data or attitude only.
+		private Vector3 positionRangeMin_;
+		private Vector3 positionRangeMax_;
+		private bool positionRangeSeeded_;
+		private const float PositionalTrackingDeadThresholdM = 0.25f;
 
 		// 0.3.17: see the comment at the write site in OnCameraPreCull - ground-truth camera
 		// world position after this mod's own Transform write, for isolating whether an offset
@@ -518,6 +525,7 @@ namespace HeadTrackARKit {
 				state_.PushSample(unityPos, unityRot);
 				lastRawArEuler_ = NormalizeEulerForLog(unityRot.eulerAngles);
 				lastRawArPosition_ = unityPos;
+				TrackPositionalSignalRange(unityPos);
 			}
 		}
 
@@ -698,6 +706,43 @@ namespace HeadTrackARKit {
 					// CarX's own Cinemachine solve just wrote.
 					Vector3 basePosition = car.TransformPoint(anchorLocalPosition_);
 					Quaternion baseRotation = car.rotation * anchorLocalRotation_;
+
+					if (config_.OrbitModeEnabled) {
+						// 0.4.2 - ORBIT MODE. See IHeadTrackConfig.OrbitModeEnabled for the measured
+						// justification: the phone's positional stream is dead (9 cm of range across a
+						// whole session) while its attitude stream is fully alive (359 degrees). With
+						// translation unusable, rotating the camera in place is geometrically incapable
+						// of moving it anywhere - so instead, the phone's yaw/pitch swings the camera
+						// AROUND the car on the boom length it was calibrated at, and the camera keeps
+						// looking at what it was framing. Turning the phone left now walks the camera
+						// left around the car, which is real, visible camera travel driven entirely by
+						// the one signal that works.
+						Vector3 pivotLocal = OrbitPivotLocal();
+						Vector3 boomLocal = anchorLocalPosition_ - pivotLocal;
+
+						// Yaw about the car's up axis, pitch about its right axis. Built from the same
+						// offset euler the normal path uses, so sensitivity/smoothing/inversion all
+						// still apply identically.
+						Vector3 offsetEuler = lastAppliedOffsetEuler_;
+						Quaternion orbit = Quaternion.AngleAxis(offsetEuler.y, Vector3.up) *
+						                   Quaternion.AngleAxis(offsetEuler.x, Vector3.right);
+
+						Vector3 orbitedLocal = pivotLocal + orbit * boomLocal;
+
+						// Translation, when it eventually works, still applies on top - so this needs
+						// no second code path once positional tracking is fixed phone-side.
+						Vector3 orbitedWorld = car.TransformPoint(orbitedLocal);
+						Vector3 pivotWorld = car.TransformPoint(pivotLocal);
+
+						Vector3 aim = pivotWorld - orbitedWorld;
+						Quaternion orbitRotation = aim.sqrMagnitude > 1e-8f
+							? Quaternion.LookRotation(aim, car.up)
+							: baseRotation;
+
+						basePosition = orbitedWorld;
+						baseRotation = orbitRotation * Quaternion.AngleAxis(offsetEuler.z, Vector3.forward);
+						rotOffset = Quaternion.identity; // the orbit already consumed the rotation
+					}
 
 					if (config_.ClippingGuardEnabled && posOffset.sqrMagnitude > 1e-6f) {
 						posOffset = ApplyClippingGuard(basePosition, baseRotation, posOffset);
@@ -985,6 +1030,25 @@ namespace HeadTrackARKit {
 				// inferring backwards - which is a bad way to read a log. If the camera isn't moving,
 				// exactly one of these two being false is the first thing to rule out, so it should be
 				// stated positively rather than reconstructed.
+				// 0.4.2: state whether the phone is actually sending positional data. See
+				// TrackPositionalSignalRange - this is the measurement that explains the entire
+				// "objects move but the camera doesn't" report, so it belongs in every heartbeat.
+				if (positionRangeSeeded_) {
+					Vector3 span = positionRangeMax_ - positionRangeMin_;
+					float widest = Mathf.Max(span.x, Mathf.Max(span.y, span.z));
+					bool positionalDead = widest < PositionalTrackingDeadThresholdM;
+					Kino.Log.Info(
+						$"[HeadTrackARKit][diag] positionalSignalRange={FormatVector(span)} widest={widest:F3}m " +
+						$"positionalTrackingLooksDead={positionalDead} orbitMode={config_.OrbitModeEnabled}");
+					if (positionalDead) {
+						Kino.Log.Warning(
+							$"[HeadTrackARKit][diag] LOTA is sending rotation but effectively no POSITION " +
+							$"(total spread {widest:F3} m). That is ARKit attitude-only - check LOTA has camera " +
+							"permission on the phone and is in a full world-tracking/6DOF mode. Orbit mode is " +
+							$"{(config_.OrbitModeEnabled ? "ON, so rotation still moves the camera around the car" : "OFF, so rotation can only pivot the camera in place")}.");
+					}
+				}
+
 				if (!config_.Enabled) {
 					Kino.Log.Warning(
 						"[HeadTrackARKit][diag] INERT: config.Enabled=false - OnCameraPreCull returns before " +
@@ -1200,6 +1264,46 @@ namespace HeadTrackARKit {
 				// Diagnostics must never be able to take the mod down.
 				Kino.Log.Warning($"[HeadTrackARKit][diag] camera ownership dump failed: {ex.Message}");
 			}
+		}
+
+		/// <summary>
+		/// The point, in car-local space, that orbit mode swings the camera around and keeps aimed at.
+		/// Derived from the calibrated pose rather than hardcoded, so it preserves whatever framing the
+		/// camera had at F9: step forward from the camera's calibrated position, along its calibrated
+		/// forward, by the boom length. For a chase cam calibrated at roughly (0, 2.8, -3.9) looking
+		/// forward and slightly down, that lands on the car - so orbiting keeps the car framed instead
+		/// of swinging it out of shot.
+		/// </summary>
+		private Vector3 OrbitPivotLocal() {
+			float boomLength = anchorLocalPosition_.magnitude;
+			if (boomLength < 0.01f) {
+				// Calibrated essentially at the car's own origin (cockpit view). There's no boom to
+				// orbit on, so orbit about the car origin itself.
+				return Vector3.zero;
+			}
+
+			Vector3 forwardLocal = anchorLocalRotation_ * Vector3.forward;
+			return anchorLocalPosition_ + forwardLocal * boomLength;
+		}
+
+		/// <summary>
+		/// 0.4.2: tracks the spread of the incoming ARKit position stream so a dead positional signal
+		/// is reported outright instead of having to be inferred. A phone being physically moved
+		/// produces metres of range here; the measured 0.4.1 session produced 9 cm total while
+		/// simultaneously reporting 359 degrees of yaw, which is the signature of ARKit running
+		/// attitude-only (no visual world tracking - typically camera permission not granted to LOTA,
+		/// or an orientation-only session configuration).
+		/// </summary>
+		private void TrackPositionalSignalRange(Vector3 rawPosition) {
+			if (!positionRangeSeeded_) {
+				positionRangeMin_ = rawPosition;
+				positionRangeMax_ = rawPosition;
+				positionRangeSeeded_ = true;
+				return;
+			}
+
+			positionRangeMin_ = Vector3.Min(positionRangeMin_, rawPosition);
+			positionRangeMax_ = Vector3.Max(positionRangeMax_, rawPosition);
 		}
 
 		private bool IsInPhotoMode() {
@@ -1497,6 +1601,11 @@ namespace HeadTrackARKit {
 				config_.RotationSensitivityUnityGained = true;
 			}
 
+			if (!config_.OrbitModeDefaulted) {
+				config_.OrbitModeEnabled = true;
+				config_.OrbitModeDefaulted = true;
+			}
+
 			if (!config_.StatusHudDefaulted) {
 				config_.ShowStatusHud = true;
 				config_.StatusHudDefaulted = true;
@@ -1585,6 +1694,14 @@ namespace HeadTrackARKit {
 			bool showStatusHud = config_.ShowStatusHud;
 			if (Kino.UI.Toggle("Show on-screen status (top-left corner)", ref showStatusHud)) {
 				config_.ShowStatusHud = showStatusHud;
+			}
+
+			// 0.4.2: see IHeadTrackConfig.OrbitModeEnabled. Left switchable because once positional
+			// tracking is working phone-side, straight 1:1 (orbit off) is the more faithful mode.
+			bool orbitMode = config_.OrbitModeEnabled;
+			if (Kino.UI.Toggle("Orbit around car (needed while phone sends rotation only)", ref orbitMode)) {
+				config_.OrbitModeEnabled = orbitMode;
+				Kino.Log.Info($"[HeadTrackARKit] Orbit mode toggled {(orbitMode ? "ON" : "OFF")}.");
 			}
 
 			if (Kino.UI.Input(ref portText_, 5, "^[0-9]{1,5}$")) {

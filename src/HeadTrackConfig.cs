@@ -159,5 +159,20 @@ namespace HeadTrackARKit {
 		/// RotationSensitivity back to exactly 1.0 once on 0.4.0+, regardless of the saved value.
 		/// </summary>
 		bool RotationSensitivityUnityGained { get; set; }
+
+		/// <summary>
+		/// Orbit mode. Measured evidence (0.4.1 session, 108 samples) is that LOTA's ARKit stream
+		/// carries a full 359 degrees of rotation range but only 9 cm of positional range - i.e.
+		/// attitude works and positional world tracking does not. With no usable translation signal,
+		/// applying rotation alone can only ever spin the camera about its own pivot, which moves it
+		/// nowhere: the world sweeps past and the camera never travels. Orbit mode converts the signal
+		/// that does work into the motion that was actually wanted, swinging the camera *around* the
+		/// car (keeping it framed) instead of pivoting in place. On by default - see
+		/// <see cref="OrbitModeDefaulted"/>.
+		/// </summary>
+		bool OrbitModeEnabled { get; set; }
+
+		/// <summary>One-time migration so <see cref="OrbitModeEnabled"/> defaults on, not off.</summary>
+		bool OrbitModeDefaulted { get; set; }
 	}
 }

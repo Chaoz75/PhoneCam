@@ -117,6 +117,37 @@ def angle_between(qa, qb):
     return math.degrees(2.0 * math.atan2(math.sqrt(vx * vx + vy * vy + vz * vz), abs(w)))
 
 
+def mat_to_quat(m):
+    """
+    Rotation matrix (basis vectors as COLUMNS, m[row][col]) -> quaternion.
+
+    Full four-branch Shepperd's method. The naive single-branch trace formula is
+    only valid while trace > 0; past ~120 degrees of rotation the trace goes
+    negative and that formula divides by a vanishing (or imaginary) term. An
+    earlier revision of this harness fell back to identity in that case, which
+    silently produced up to 180 degrees of error for exactly the wide orbit
+    angles being tested - a harness bug that looked like an algorithm bug.
+    Branching on the largest diagonal element keeps the divisor well away from
+    zero for every possible rotation.
+    """
+    m00, m01, m02 = m[0]
+    m10, m11, m12 = m[1]
+    m20, m21, m22 = m[2]
+    tr = m00 + m11 + m22
+
+    if tr > 0.0:
+        s = math.sqrt(tr + 1.0) * 2.0
+        return ((m21 - m12) / s, (m02 - m20) / s, (m10 - m01) / s, 0.25 * s)
+    if m00 > m11 and m00 > m22:
+        s = math.sqrt(1.0 + m00 - m11 - m22) * 2.0
+        return (0.25 * s, (m01 + m10) / s, (m02 + m20) / s, (m21 - m12) / s)
+    if m11 > m22:
+        s = math.sqrt(1.0 + m11 - m00 - m22) * 2.0
+        return ((m01 + m10) / s, 0.25 * s, (m12 + m21) / s, (m02 - m20) / s)
+    s = math.sqrt(1.0 + m22 - m00 - m11) * 2.0
+    return ((m02 + m20) / s, (m12 + m21) / s, 0.25 * s, (m10 - m01) / s)
+
+
 # ------------------------------------------------------------------ transform
 class Xform:
     __slots__ = ("pos", "rot")
@@ -332,4 +363,133 @@ for status, name, _ in results:
 print("=" * 78)
 print(f"{len(results) - len(failed)}/{len(results)} checks passed")
 if failed:
+    raise SystemExit(1)
+
+
+# ============================================================================
+# 0.4.2 ORBIT MODE
+# Measured from a real 0.4.1 session (108 samples): the phone's ARKit stream
+# carries 359 deg of yaw range but only 0.094 m of positional range. So the
+# only usable signal is rotation. These checks establish what each mode can
+# actually do with rotation-only input.
+# ============================================================================
+print("\n" + "=" * 78)
+print("0.4.2 orbit mode - rotation-only input")
+print("=" * 78 + "\n")
+
+
+def orbit_pivot_local(anchor_local_pos, anchor_local_rot):
+    boom = vlen(anchor_local_pos)
+    if boom < 0.01:
+        return (0.0, 0.0, 0.0)
+    fwd = qrot(anchor_local_rot, (0.0, 0.0, 1.0))
+    return vadd(anchor_local_pos, (fwd[0] * boom, fwd[1] * boom, fwd[2] * boom))
+
+
+def orbit(car, anchor_local_pos, anchor_local_rot, offset_euler, pos_offset=(0, 0, 0)):
+    """0.4.2 orbit mode, mirroring the C# exactly."""
+    pitch, yaw, roll = offset_euler
+    pivot_local = orbit_pivot_local(anchor_local_pos, anchor_local_rot)
+    boom_local = vsub(anchor_local_pos, pivot_local)
+
+    q = qmul(qaxisangle((0, 1, 0), yaw), qaxisangle((1, 0, 0), pitch))
+    orbited_local = vadd(pivot_local, qrot(q, boom_local))
+
+    orbited_world = car.transform_point(orbited_local)
+    pivot_world = car.transform_point(pivot_local)
+
+    aim = vsub(pivot_world, orbited_world)
+    car_up = qrot(car.rot, (0.0, 1.0, 0.0))
+    # Quaternion.LookRotation(aim, car.up)
+    f = [c / (vlen(aim) or 1.0) for c in aim]
+    r = (car_up[1] * f[2] - car_up[2] * f[1],
+         car_up[2] * f[0] - car_up[0] * f[2],
+         car_up[0] * f[1] - car_up[1] * f[0])
+    rl = vlen(r) or 1.0
+    r = [c / rl for c in r]
+    u = (f[1] * r[2] - f[2] * r[1], f[2] * r[0] - f[0] * r[2], f[0] * r[1] - f[1] * r[0])
+    m = [[r[0], u[0], f[0]], [r[1], u[1], f[1]], [r[2], u[2], f[2]]]
+    rot = mat_to_quat(m)
+    rot = qmul(rot, qaxisangle((0, 0, 1), roll))
+    return (vadd(orbited_world, qrot(rot, pos_offset)), rot, pivot_world)
+
+
+# Real values straight out of the live log.
+anchor_lp = (0.01, 2.84, -3.88)          # car-local camera pose at F9, MazdaRX7
+anchor_lr = qeuler(20.0, 0.0, 0.0)       # chase cam aimed forward and down
+car = car_at(2.0)
+
+# --- T7: rotation-only input must actually move the camera --------------------
+travel_by_mode = {}
+look = (0.0, 30.0, 0.0)  # 30 deg of phone yaw, no translation at all
+
+p_base = car.transform_point(anchor_lp)
+p_rig, _ = rig(car, anchor_lp, anchor_lr, (0, 0, 0), qeuler(*look))
+travel_by_mode["rig 1:1 (0.4.0)"] = vlen(vsub(p_rig, p_base))
+
+cam_now = carx_chase_cam(car, 2.0)
+p_add, _ = additive(cam_now, (0, 0, 0), qeuler(*look))
+travel_by_mode["additive (<=0.3.31)"] = vlen(vsub(p_add, cam_now.pos))
+
+p_orb, _, pivot_w = orbit(car, anchor_lp, anchor_lr, look)
+travel_by_mode["orbit (0.4.2)"] = vlen(vsub(p_orb, p_base))
+
+for mode, d in travel_by_mode.items():
+    print(f"        {mode:24} camera travel for a 30 deg phone turn = {d:6.3f} m")
+
+check(
+    "T7  rotation-only input produces real camera travel in orbit mode",
+    travel_by_mode["orbit (0.4.2)"] > 1.0
+    and travel_by_mode["rig 1:1 (0.4.0)"] < 1e-9
+    and travel_by_mode["additive (<=0.3.31)"] < 1e-9,
+    f"orbit={travel_by_mode['orbit (0.4.2)']:.3f} m vs 0.000 m for both older modes "
+    f"- this is why the camera never appeared to move",
+)
+
+# --- T8: orbit keeps the car framed -------------------------------------------
+worst_aim = 0.0
+worst_radius_err = 0.0
+r0 = vlen(vsub(car.transform_point(anchor_lp), car.transform_point(orbit_pivot_local(anchor_lp, anchor_lr))))
+for yaw in range(-180, 181, 5):
+    for pitch in (-25.0, 0.0, 25.0):
+        p, r, pw = orbit(car, anchor_lp, anchor_lr, (pitch, float(yaw), 0.0))
+        fwd = qrot(r, (0.0, 0.0, 1.0))
+        to_pivot = vsub(pw, p)
+        n = vlen(to_pivot) or 1.0
+        cosang = sum(a * b / n for a, b in zip(to_pivot, fwd))
+        worst_aim = max(worst_aim, math.degrees(math.acos(max(-1.0, min(1.0, cosang)))))
+        worst_radius_err = max(worst_radius_err, abs(vlen(to_pivot) - r0))
+
+check(
+    "T8  orbit keeps the framed point centred at a constant radius",
+    worst_aim < 1e-3 and worst_radius_err < 1e-9,
+    f"across 111 orbit positions: max aim error {worst_aim:.2e} deg, "
+    f"max radius drift {worst_radius_err:.2e} m (radius {r0:.2f} m)",
+)
+
+# --- T9: orbit still follows the car ------------------------------------------
+worst_follow = 0.0
+for t in TIMES:
+    c = car_at(t)
+    p, _, pw = orbit(c, anchor_lp, anchor_lr, (5.0, 40.0, 0.0))
+    # the orbited point must stay fixed in the car's own frame
+    local = c.inverse_transform_point(p)
+    expected = vadd(orbit_pivot_local(anchor_lp, anchor_lr),
+                    qrot(qmul(qaxisangle((0, 1, 0), 40.0), qaxisangle((1, 0, 0), 5.0)),
+                         vsub(anchor_lp, orbit_pivot_local(anchor_lp, anchor_lr))))
+    worst_follow = max(worst_follow, vlen(vsub(local, expected)))
+
+check(
+    "T9  orbit rides with the car (car-local, not world-locked)",
+    worst_follow < 1e-9,
+    f"max car-relative deviation over {len(TIMES)} frames: {worst_follow:.2e} m",
+)
+
+print("\n" + "=" * 78)
+failed2 = [r for r in results if r[0] == FAIL]
+for status, name, _ in results:
+    print(f"  {status}  {name}")
+print("=" * 78)
+print(f"{len(results) - len(failed2)}/{len(results)} checks passed")
+if failed2:
     raise SystemExit(1)
