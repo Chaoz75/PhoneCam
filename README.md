@@ -9,6 +9,59 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.5.3** - Two more jitter sources. Both are the same *kind* of bug 0.5.2 fixed, in places 0.5.2 missed.
+
+### 1. `ResetCameraOverride` was running every single frame
+
+0.3.19 established that reassigning `worldToCameraMatrix` / `projectionMatrix` interferes with the
+render pipeline's per-frame TAA jitter and temporal motion-vector bookkeeping — that was the original
+"crazy motion blur while standing still" and "shadows flicker" cause. The *override* was then correctly
+scoped to Photo Mode only… but the matching **reset** was left running unconditionally, every frame, and
+it touches exactly the same three matrices:
+
+```csharp
+cam.ResetWorldToCameraMatrix();
+cam.ResetProjectionMatrix();     // discards HDRP's sub-pixel TAA jitter for the frame
+cam.ResetCullingMatrix();
+```
+
+`ResetProjectionMatrix` in particular throws away HDRP's sub-pixel TAA jitter, so the temporal filter
+gets an inconsistent projection history — shimmer that is most visible while the view is moving, i.e.
+while driving. Since 0.5.0 moved the write into `onBeforeRender`, this now lands immediately before HDRP
+sets up the frame, so the interference is direct. Now gated behind `cameraOverrideApplied_`: the reset
+only runs on the transition out of an override that was actually applied.
+
+### 2. The zoom/FOV write was compounding
+
+Identical to the pose bug 0.5.2 fixed, missed because it lives a few lines earlier:
+
+```csharp
+cam.fieldOfView += zoomCurrentDegrees_;   // assumes the game rewrites FOV every frame
+```
+
+`CarX.FollowCamera` drives FOV from speed (`m_carFieldOfView`, `m_carFieldOfViewCurrent`,
+`m_carFieldOfViewTarget`), so while driving it rewrites FOV constantly — but not necessarily on every
+rendered frame. On the frames it doesn't, the delta stacked on our own previous output and the view
+pumped in and out. Same idempotency treatment as the pose: remember the FOV the game gave us and the FOV
+we wrote, and rebuild from the game's value.
+
+### Verification (`tools/jitter_proof.py`, now 4 checks)
+
+| Check | Before | After |
+|---|---|---|
+| Pose accumulation (0.5.2) | 0.50 m oscillation | 0.00e+00 |
+| Smoothing vs packet rate (0.5.2) | varies by 0.644 | 0.00e+00 |
+| Smoothing vs frame rate (0.5.2) | — | identical at 30/60/144 fps |
+| **FOV pumping (new)** | **12.0 deg swing** | **0.00e+00** |
+
+All 5 harnesses pass (4 jitter, 9 geometry, 3 regression, 3 orbit-clamp, 3 frame-order).
+
+**Honest note:** no fresh log was available when this was written (`output.log` was empty — the game had
+just restarted), so these two were found by code inspection, not by observing them. Both are real
+defects and both are fixed; whether either was *the* remaining jitter is unconfirmed. The
+`unrefreshedFrames=` heartbeat line added in 0.5.2 is the fastest way to tell: if it is climbing, the
+Brain is skipping frames and the idempotency paths are doing real work.
+
 **0.5.2** - Fixes the back-and-forth shake while driving. Two independent causes, both real bugs.
 
 ### 1. The additive write was compounding

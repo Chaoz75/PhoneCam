@@ -22,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.5.2", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.5.3", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.5.2";
+		private const string CurrentVersion = "0.5.3";
 
 		private const int DefaultOscPort = 9000;
 
@@ -89,6 +89,16 @@ namespace HeadTrackARKit {
 		private Quaternion poseWeWroteRotation_ = Quaternion.identity;
 		private bool hasGameBasePose_;
 		private int unrefreshedFrames_;
+
+		// 0.5.3: same idempotency pair for the zoom/FOV write.
+		private float gameBaseFov_;
+		private float fovWeWrote_;
+		private bool hasGameBaseFov_;
+
+		// 0.5.3: tracks whether a custom camera matrix is currently applied, so the Reset* calls only
+		// run on the transition out of that state instead of every single frame - see
+		// ResetCameraOverrideIfApplied.
+		private bool cameraOverrideApplied_;
 
 		// 0.4.6: bounds on the orbit arc - see the clamp in OnCameraPreCull for the measured reason.
 		// Yaw gets a usable arc; pitch stays small because pitch is what swings the camera under the car.
@@ -753,7 +763,7 @@ namespace HeadTrackARKit {
 
 			if (!config_.Enabled) {
 				// Make sure a previous frame's override doesn't linger once the mod is turned off.
-				ResetCameraOverride(cam);
+				ResetCameraOverrideIfApplied(cam);
 			}
 		}
 
@@ -801,9 +811,28 @@ namespace HeadTrackARKit {
 		private void ApplyTrackingToCamera(Camera cam) {
 
 			// Zoom applies independently of head-tracking calibration.
+			//
+			// 0.5.3: this had exactly the same compounding bug the pose write had (0.5.2) - it was
+			// `cam.fieldOfView += zoom` every frame, which silently assumes the game rewrites FOV every
+			// frame. CarX.FollowCamera drives FOV from speed (m_carFieldOfView /
+			// m_carFieldOfViewCurrent / m_carFieldOfViewTarget), so while DRIVING the FOV it writes
+			// changes constantly - and on any frame it doesn't write, our delta stacked on the previous
+			// frame's result and the view pumped in and out. Same idempotency treatment: remember the
+			// FOV the game gave us and the FOV we wrote, and rebuild from the game's value rather than
+			// from our own previous output.
 			bool hasZoom = Mathf.Abs(zoomCurrentDegrees_) > 0.001f;
 			if (hasZoom) {
+				if (hasGameBaseFov_ && Mathf.Abs(cam.fieldOfView - fovWeWrote_) < 0.0001f) {
+					cam.fieldOfView = gameBaseFov_;
+				}
+				gameBaseFov_ = cam.fieldOfView;
+				hasGameBaseFov_ = true;
+
 				cam.fieldOfView = Mathf.Clamp(cam.fieldOfView + zoomCurrentDegrees_, 1f, 179f);
+				fovWeWrote_ = cam.fieldOfView;
+			}
+			else {
+				hasGameBaseFov_ = false;
 			}
 
 			// 0.3.8: writes the head-tracking offset onto the camera's real Transform, added on
@@ -843,7 +872,7 @@ namespace HeadTrackARKit {
 			                   (Environment.TickCount - receiver_.LastMessageTick) > OscSignalLostThresholdMs;
 
 			if (state_.IsCalibrated && signalStale) {
-				ResetCameraOverride(cam);
+				ResetCameraOverrideIfApplied(cam);
 				return;
 			}
 
@@ -1013,8 +1042,11 @@ namespace HeadTrackARKit {
 			// magnitude judgment call, no flicker.
 			if ((hasZoom || state_.IsCalibrated) && IsInPhotoMode()) {
 				ApplyCameraOverride(cam);
+				cameraOverrideApplied_ = true;
 			} else {
-				ResetCameraOverride(cam);
+				// 0.5.3: gated - see ResetCameraOverrideIfApplied. Calling the Reset* trio every frame
+				// was discarding HDRP's per-frame TAA jitter and destabilising temporal reprojection.
+				ResetCameraOverrideIfApplied(cam);
 			}
 		}
 
@@ -1043,6 +1075,30 @@ namespace HeadTrackARKit {
 			cam.ResetWorldToCameraMatrix();
 			cam.ResetProjectionMatrix();
 			cam.ResetCullingMatrix();
+		}
+
+		/// <summary>
+		/// 0.5.3: only reset the camera matrices when we actually have an override applied.
+		///
+		/// This mod's own history (0.3.19) established that touching
+		/// worldToCameraMatrix/projectionMatrix interferes with the render pipeline's per-frame TAA
+		/// jitter and temporal motion-vector bookkeeping - that is what produced the original "crazy
+		/// motion blur while standing still" and "shadows flicker" reports. The override itself was
+		/// then correctly scoped to Photo Mode only... but the matching <see cref="ResetCameraOverride"/>
+		/// was left running unconditionally on EVERY frame, and it touches exactly the same three
+		/// matrices. ResetProjectionMatrix in particular discards HDRP's sub-pixel TAA jitter for that
+		/// frame; doing it every frame gives the temporal filter an inconsistent projection history,
+		/// which shows up as shimmer/jitter and is most visible while the view is moving - i.e. while
+		/// driving. Now that the write happens in onBeforeRender (0.5.0), this lands right before HDRP
+		/// sets up the frame, so the interference is direct.
+		///
+		/// Resetting a camera that was never overridden is a no-op in intent but not in effect, so it
+		/// is simply not done any more.
+		/// </summary>
+		private void ResetCameraOverrideIfApplied(Camera cam) {
+			if (!cameraOverrideApplied_) return;
+			ResetCameraOverride(cam);
+			cameraOverrideApplied_ = false;
 		}
 
 		/// <summary>

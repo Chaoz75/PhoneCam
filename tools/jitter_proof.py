@@ -107,7 +107,47 @@ ok3 = max(fps_vals)-min(fps_vals) < 0.02
 print(f"  [{'PASS' if ok3 else 'FAIL'}] and frame-rate independent: 30/60/144 fps -> "
       f"{fps_vals[0]:.4f}/{fps_vals[1]:.4f}/{fps_vals[2]:.4f}")
 
+
+# ---------------------------------------------------------------- (3) FOV
 print()
 print("="*76)
-n=sum([ok1,ok2,ok3]); print(f"{n}/3 passed")
-raise SystemExit(0 if n==3 else 1)
+print("(3) ZOOM/FOV ACCUMULATION — same bug class as (1), on cam.fieldOfView")
+print("    CarX.FollowCamera drives FOV from speed (m_carFieldOfView /")
+print("    m_carFieldOfViewCurrent / m_carFieldOfViewTarget), so while driving it")
+print("    rewrites FOV often but not necessarily every rendered frame.")
+print("="*76)
+ZOOM = 6.0          # degrees of zoom offset held steady
+GAME_FOV = 60.0
+
+def run_fov(idempotent):
+    fov = GAME_FOV
+    base = None; wrote = None
+    out = []
+    last_phys = -1
+    for f in range(int(RENDER_HZ*SECONDS)):
+        t = f/RENDER_HZ
+        step = int(t*PHYS_HZ)
+        refreshed = step != last_phys
+        last_phys = step
+        if refreshed:
+            fov = GAME_FOV                      # game rewrites FOV
+        if idempotent:
+            if wrote is not None and abs(fov-wrote) < 1e-4:
+                fov = base
+            base = fov
+        fov = min(179.0, max(1.0, fov + ZOOM))  # our write
+        wrote = fov
+        out.append(fov)
+    return out
+
+fo, fn = run_fov(False), run_fov(True)
+print(f"  BEFORE  fov ranges {min(fo):.1f} .. {max(fo):.1f} deg  (should be a steady {GAME_FOV+ZOOM:.0f})")
+print(f"  AFTER   fov ranges {min(fn):.1f} .. {max(fn):.1f} deg")
+ok4 = (max(fo)-min(fo)) > 1.0 and (max(fn)-min(fn)) < 1e-6
+print(f"  [{'PASS' if ok4 else 'FAIL'}] FOV pumping reproduced before "
+      f"({max(fo)-min(fo):.1f} deg swing) and eliminated after ({max(fn)-min(fn):.0e} deg)")
+
+print()
+print("="*76)
+n=sum([ok1,ok2,ok3,ok4]); print(f"{n}/4 passed")
+raise SystemExit(0 if n==4 else 1)
