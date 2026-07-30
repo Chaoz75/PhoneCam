@@ -9,6 +9,53 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.5.4** - Fixes the drive/drift shake at its actual source, and adds the missing translation invert.
+
+### 1. Shake while driving, steady when parked
+
+The translation was expressed in the camera's **live rotation**:
+
+```csharp
+t.position += t.rotation * posOffset;
+```
+
+That rotation is anything but steady while driving. `CarX.FollowCamera` adds sway
+(`m_SwaySpeed`, `m_BaseSwayAmount`, `m_TrackingSwayAmount`) and, during a drift, yaws hard to follow the
+car's slip angle. Rotating a **fixed** phone offset by a rapidly swinging rotation sweeps the resulting
+world-space offset around — so a perfectly motionless phone still moved the camera, and the effect
+scaled with how violently the camera was being thrown about. Parked, that rotation is steady and the
+same offset is rock solid. That is precisely "shakes when I drive, fine when I stop".
+
+The offset frame now comes from the **car's heading, yaw only** (`GetStableOffsetFrame`), falling back
+to the camera's own yaw when there is no car. The car's heading changes smoothly and carries none of the
+camera's sway or drift-follow swing. Yaw-only also stops camera pitch/roll tipping a sideways lean into
+a vertical one — the same class of bug 0.3.16 fixed for the calibration frame.
+
+### 2. Phone left moved the camera right
+
+There were **no** translation invert options — only `InvertPitch` / `InvertYaw` for rotation — so a
+reversed left/right mapping could not be corrected from the panel at all. ARKit reports gravity-aligned
+world position and `ArKitConversion` mirrors only Z for handedness, so whether the resulting X matches
+the player's sense of "left" depends on the ARKit session origin, fixed when tracking starts. Not
+derivable, so it is now a switch: **Invert left/right / up-down / forward-back movement**, with
+left/right defaulted **on** to correct the reported behaviour.
+
+### Verification (`tools/offset_frame_proof.py`)
+
+Phone held perfectly still (constant 10 cm lean). Measured as the offset expressed **in the car's
+frame** — with a motionless phone this should be constant, so any variation is the camera wobbling
+relative to the car:
+
+| | ≤0.5.3 (live camera rotation) | 0.5.4 (car heading, yaw only) |
+|---|---|---|
+| Parked | 0.00 cm | 0.00 cm |
+| **Driving / drifting** | **5.71 cm of wobble** | **0.00 cm** |
+
+Choosing that metric took two wrong attempts, both recorded in the script: total path length is
+dominated by the car's own smooth heading change (large in *both* frames, and not shake), and total
+jerk still counts the smooth circular sweep of an offset riding with a turning car. Only the
+car-relative spread isolates the artefact. 6/6 harnesses pass.
+
 **0.5.3** - Two more jitter sources. Both are the same *kind* of bug 0.5.2 fixed, in places 0.5.2 missed.
 
 ### 1. `ResetCameraOverride` was running every single frame

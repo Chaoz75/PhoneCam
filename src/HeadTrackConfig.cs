@@ -127,6 +127,29 @@ namespace HeadTrackARKit {
 		/// <summary>Flips the left/right look direction.</summary>
 		bool InvertYaw { get; set; }
 
+		// --- Position (translation) direction ---
+		// 0.5.4: these did not exist before. Only rotation had invert switches, so a reversed
+		// TRANSLATION axis - moving the phone left and having the camera slide right - was not
+		// correctable from the settings panel at all. ARKit reports gravity-aligned world position and
+		// ArKitConversion mirrors only Z for handedness, so whether the resulting X ends up matching
+		// the player's sense of "left" depends on the ARKit session origin, which is fixed when
+		// tracking starts. That cannot be derived reliably, so it is exposed as a switch.
+
+		/// <summary>Flips left/right physical movement.</summary>
+		bool InvertPositionX { get; set; }
+
+		/// <summary>Flips up/down physical movement.</summary>
+		bool InvertPositionY { get; set; }
+
+		/// <summary>Flips forward/back physical movement.</summary>
+		bool InvertPositionZ { get; set; }
+
+		/// <summary>
+		/// One-time migration. Defaults <see cref="InvertPositionX"/> on, because the shipped mapping
+		/// was reported backwards (phone left moved the camera right).
+		/// </summary>
+		bool PositionInvertDefaulted { get; set; }
+
 		// --- Privacy ---
 
 		/// <summary>

@@ -22,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.5.3", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.5.4", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.5.3";
+		private const string CurrentVersion = "0.5.4";
 
 		private const int DefaultOscPort = 9000;
 
@@ -808,6 +808,52 @@ namespace HeadTrackARKit {
 			}
 		}
 
+		/// <summary>
+		/// 0.5.4: a steady frame to express the tracked translation in - see the call site for why the
+		/// camera's live rotation was the wrong choice.
+		///
+		/// Preference order:
+		///  1. The car's heading, yaw only. Smooth, and free of the camera's sway and drift-follow
+		///     swing, so a motionless phone yields a motionless offset no matter how hard the camera is
+		///     being thrown around.
+		///  2. The camera's own heading, yaw only, when there is no car (garage, menus, spectating).
+		///     Still strips pitch/roll sway; only the yaw component can move, and it moves smoothly.
+		///
+		/// Yaw-only in both cases: taking the full rotation would let camera pitch or roll tip a
+		/// sideways lean into a vertical one, which is the same class of bug 0.3.16 fixed for the
+		/// calibration frame.
+		/// </summary>
+		/// <summary>
+		/// 0.5.4: per-axis flip for the tracked translation. Rotation has had InvertPitch/InvertYaw
+		/// since 0.3.13, but translation had no equivalent, so a reversed left/right mapping (phone
+		/// left, camera right) could not be corrected from the settings panel at all. Applied after
+		/// GetPositionOffset, i.e. in the calibration-yaw frame, so X is straightforwardly
+		/// "left/right as you were facing when you pressed F9".
+		/// </summary>
+		private Vector3 ApplyPositionInvert(Vector3 offset) {
+			if (config_.InvertPositionX) offset.x = -offset.x;
+			if (config_.InvertPositionY) offset.y = -offset.y;
+			if (config_.InvertPositionZ) offset.z = -offset.z;
+			return offset;
+		}
+
+		private Quaternion GetStableOffsetFrame(Transform cameraTransform) {
+			Transform car = GetCarTransform();
+
+			Vector3 forward = car != null ? car.forward : cameraTransform.forward;
+
+			// Flatten to the horizontal plane. Degenerate only if looking exactly straight up or down,
+			// in which case fall back to the transform's own flattened right vector for a stable basis.
+			Vector3 flat = new Vector3(forward.x, 0f, forward.z);
+			if (flat.sqrMagnitude < 1e-6f) {
+				Vector3 right = car != null ? car.right : cameraTransform.right;
+				flat = new Vector3(right.z, 0f, -right.x);
+				if (flat.sqrMagnitude < 1e-6f) return Quaternion.identity;
+			}
+
+			return Quaternion.LookRotation(flat.normalized, Vector3.up);
+		}
+
 		private void ApplyTrackingToCamera(Camera cam) {
 
 			// Zoom applies independently of head-tracking calibration.
@@ -877,7 +923,7 @@ namespace HeadTrackARKit {
 			}
 
 			if (state_.IsCalibrated) {
-				Vector3 posOffset = state_.GetPositionOffset();
+				Vector3 posOffset = ApplyPositionInvert(state_.GetPositionOffset());
 				Quaternion rotOffset = FixLookDirection(state_.GetRotationOffsetEuler());
 
 				Transform t = cam.transform;
@@ -992,13 +1038,32 @@ namespace HeadTrackARKit {
 					t.rotation = aimCorrection * t.rotation * rotOffset;
 				}
 				else {
+					// 0.5.4 - FIXES THE DRIVING/DRIFTING SHAKE.
+					//
+					// This used to be `t.position += t.rotation * posOffset`, i.e. the translation was
+					// expressed in the camera's LIVE rotation. That rotation is anything but steady while
+					// driving: CarX.FollowCamera adds sway (m_SwaySpeed / m_BaseSwayAmount /
+					// m_TrackingSwayAmount) and, during a drift, the camera yaws hard to follow the car's
+					// slip angle. Rotating a fixed phone offset by a rapidly swinging rotation sweeps the
+					// resulting WORLD offset around, so a perfectly still phone still produced a camera
+					// that wobbled - and it scaled with how violently the camera was moving. Parked, the
+					// rotation is steady and the same offset is rock solid, which is exactly the reported
+					// "shakes while driving, fine when stopped".
+					//
+					// The offset frame is now taken from the CAR's heading (yaw only) instead. The car's
+					// yaw changes smoothly and carries none of the camera's sway or drift-follow
+					// swing, so a still phone gives a still offset. Yaw-only also means leaning never
+					// gets tilted into the vertical axis by camera pitch/roll. "Left" is now left
+					// relative to the car, which is also the more intuitive mapping.
+					Quaternion offsetFrame = GetStableOffsetFrame(t);
+
 					if (config_.ClippingGuardEnabled && posOffset.sqrMagnitude > 1e-6f) {
-						posOffset = ApplyClippingGuard(t.position, t.rotation, posOffset);
+						posOffset = ApplyClippingGuard(t.position, offsetFrame, posOffset);
 					}
 
 					lastAppliedPosOffset_ = posOffset;
 
-					t.position += t.rotation * posOffset;
+					t.position += offsetFrame * posOffset;
 					t.rotation = t.rotation * rotOffset;
 				}
 
@@ -1922,6 +1987,12 @@ namespace HeadTrackARKit {
 			// turned out to be 0.5.0's frame-ordering bug, not weak motion. Now that the write actually
 			// reaches the screen, both of those read as the camera sliding sideways and swinging around
 			// the car instead of sitting still and turning like a head. Reset once to plain 1:1.
+			// 0.5.4: reported backwards - moving the phone left slid the camera right.
+			if (!config_.PositionInvertDefaulted) {
+				config_.InvertPositionX = true;
+				config_.PositionInvertDefaulted = true;
+			}
+
 			if (!config_.PostFrameOrderRetune) {
 				config_.OrbitModeEnabled = false;
 				config_.PositionSensitivity = 1.0f;
@@ -2111,6 +2182,14 @@ namespace HeadTrackARKit {
 			Kino.UI.HorizontalLine();
 			Kino.UI.GroupLabel("Look direction");
 			Kino.UI.Label("If up/down or left/right ever feels backwards or reversed, flip it here.");
+
+			Kino.UI.GroupLabel("Movement direction");
+			bool invPosX = config_.InvertPositionX;
+			if (Kino.UI.Toggle("Invert left/right movement", ref invPosX)) config_.InvertPositionX = invPosX;
+			bool invPosY = config_.InvertPositionY;
+			if (Kino.UI.Toggle("Invert up/down movement", ref invPosY)) config_.InvertPositionY = invPosY;
+			bool invPosZ = config_.InvertPositionZ;
+			if (Kino.UI.Toggle("Invert forward/back movement", ref invPosZ)) config_.InvertPositionZ = invPosZ;
 
 			bool invertPitch = config_.InvertPitch;
 			if (Kino.UI.Toggle("Invert up/down look", ref invertPitch)) {
