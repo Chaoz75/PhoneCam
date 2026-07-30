@@ -22,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.4.4", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.4.5", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.4.4";
+		private const string CurrentVersion = "0.4.5";
 
 		private const int DefaultOscPort = 9000;
 
@@ -335,7 +335,19 @@ namespace HeadTrackARKit {
 		/// LogCameraDiagnostics) so a future log shows this continuously, not just at the edges.
 		/// </summary>
 		private void CheckOscSignalHealth() {
-			if (!config_.Enabled || !receiver_.IsRunning) return;
+			if (!config_.Enabled) return;
+
+			// 0.4.5 BUG FIX: this used to also `return` when !receiver_.IsRunning, which meant the
+			// 0.3.31 auto-rebind below could never fire in the one situation it was written for - a
+			// receiver that has actually stopped. A real log caught the consequence: receiverRunning
+			// =False with the packet counter frozen for 109 seconds and no rebind ever attempted,
+			// because this guard bailed out first. If the socket is down while we're supposed to be
+			// enabled, rebinding is exactly the right thing to do, so that case now falls through to
+			// the restart logic instead of being skipped.
+			if (!receiver_.IsRunning) {
+				TryAutoRestartReceiver(-1);
+				return;
+			}
 
 			// LastMessageTick is still 0 before the very first packet ever arrives - that's "never
 			// connected yet," not "signal lost," so it's excluded here rather than immediately
@@ -379,17 +391,28 @@ namespace HeadTrackARKit {
 			// restarted. Gated well past the 2s warning threshold, and cooled down between attempts,
 			// so this can't spam reconnects during a real, ordinary phone-side outage.
 			if (gapMs > OscAutoRestartThresholdMs) {
-				int sinceLastAttempt = lastAutoRestartAttemptTick_ == 0
-					? int.MaxValue
-					: Environment.TickCount - lastAutoRestartAttemptTick_;
-				if (sinceLastAttempt > OscAutoRestartCooldownMs) {
-					lastAutoRestartAttemptTick_ = Environment.TickCount;
-					Kino.Log.Warning(
-						$"[HeadTrackARKit] Still no data after {gapMs / 1000}s - rebinding the OSC socket " +
-						"in case it went stale (won't help if LOTA genuinely isn't sending, but costs nothing to try).");
-					RestartReceiver();
-				}
+				TryAutoRestartReceiver(gapMs);
 			}
+		}
+
+		/// <summary>
+		/// Rate-limited OSC socket rebind. <paramref name="gapMs"/> is the time since the last packet,
+		/// or -1 when the receiver isn't running at all (nothing to measure a gap from).
+		/// </summary>
+		private void TryAutoRestartReceiver(int gapMs) {
+			int sinceLastAttempt = lastAutoRestartAttemptTick_ == 0
+				? int.MaxValue
+				: Environment.TickCount - lastAutoRestartAttemptTick_;
+			if (sinceLastAttempt <= OscAutoRestartCooldownMs) return;
+
+			lastAutoRestartAttemptTick_ = Environment.TickCount;
+			string reason = gapMs < 0
+				? "OSC listener is not running while the mod is enabled"
+				: $"still no data after {gapMs / 1000}s";
+			Kino.Log.Warning(
+				$"[HeadTrackARKit] {reason} - rebinding the OSC socket " +
+				"(won't help if LOTA genuinely isn't sending, but costs nothing to try).");
+			RestartReceiver();
 		}
 
 		/// <summary>
@@ -692,6 +715,27 @@ namespace HeadTrackARKit {
 			// (anchored to the car's own Transform instead of world space) is a real potential
 			// future improvement, but needs the car's actual Transform reference identified first
 			// rather than shipping another guess.
+			// 0.4.5 BUG FIX: don't keep applying a pose that stopped updating.
+			//
+			// HeadTrackState holds its last smoothed sample indefinitely and IsCalibrated stays true, so
+			// once the phone stops sending, every following frame re-applied the SAME frozen offset
+			// forever. A real log showed exactly that: incomingEuler pinned at (-15,171,83) and
+			// appliedOffsetEuler at (-3,-1,-3), bit-for-bit identical across every heartbeat, for 109
+			// seconds after the last packet. A constant offset is not tracking - it is a fixed
+			// displacement that cannot respond to the phone at all, and it looks identical to a frozen
+			// camera while every diagnostic still reports "calibrated, applying an offset".
+			//
+			// Past the staleness cutoff, leave the camera entirely alone: CarX's own solve then drives it
+			// untouched, which is honest (the mod has nothing valid to contribute) and visibly different
+			// from a freeze.
+			bool signalStale = receiver_.LastMessageTick == 0 ||
+			                   (Environment.TickCount - receiver_.LastMessageTick) > OscSignalLostThresholdMs;
+
+			if (state_.IsCalibrated && signalStale) {
+				ResetCameraOverride(cam);
+				return;
+			}
+
 			if (state_.IsCalibrated) {
 				Vector3 posOffset = state_.GetPositionOffset();
 				Quaternion rotOffset = FixLookDirection(state_.GetRotationOffsetEuler());
