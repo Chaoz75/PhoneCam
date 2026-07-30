@@ -22,14 +22,14 @@ namespace HeadTrackARKit {
 	/// </summary>
 	// Registered in KSL's Control Panel as "PhoneCam" (that's the name the maykr build key
 	// - PhoneCam_maykr.kmc - is tied to), so the metadata name here must match exactly.
-	[KSLMeta("PhoneCam", "0.6.4", "Chaoz2")]
+	[KSLMeta("PhoneCam", "0.7.0", "Chaoz2")]
 	public class HeadTrackMod : BaseMod {
 		// IMPORTANT: bump this together with the KSLMeta version string right above, every
 		// release - this is what the in-game updater compares against GitHub's latest release
 		// tag to decide whether an update is available. There's no confirmed public way to read
 		// the version back out of the KSLMeta attribute at runtime, so it's duplicated here
 		// rather than guessed at via reflection into an undocumented attribute shape.
-		private const string CurrentVersion = "0.6.4";
+		private const string CurrentVersion = "0.7.0";
 
 		private const int DefaultOscPort = 9000;
 
@@ -81,19 +81,14 @@ namespace HeadTrackARKit {
 		private Vector3 poseWrittenPosition_;
 		private bool poseWrittenThisFrame_;
 
-		// 0.5.2: idempotency state for the additive write - see RestoreGameBasePoseIfUnrefreshed.
-		// gameBase* is the pose the game handed us; poseWeWrote* is what we left on the transform.
-		private Vector3 gameBasePosition_;
-		private Quaternion gameBaseRotation_ = Quaternion.identity;
-		private Vector3 poseWeWrotePosition_;
-		private Quaternion poseWeWroteRotation_ = Quaternion.identity;
-		private bool hasGameBasePose_;
-		private int unrefreshedFrames_;
+		// 0.7.0: gameBase*/poseWeWrote*/unrefreshedFrames_ are gone. They existed to keep the additive
+		// TRANSFORM write from compounding on frames Cinemachine skipped. Nothing writes the Transform
+		// any more, so there is nothing to compound and nothing to reconcile.
 
 		// 0.6.3: which camera got the offset this frame, so OnEndCameraRendering reverts exactly that
 		// one after it has drawn - see the comment there for why reverting matters.
-		private Camera poseAppliedCamera_;
-		private bool poseAppliedThisFrame_;
+		// 0.7.0: whether a view-matrix override is currently installed on the camera.
+		private bool viewMatrixOverridden_;
 
 		// 0.6.4: see ShouldLogVerbose - keeps the formerly per-frame diagnostics off the hot path.
 		private float lastVerboseLogTime_;
@@ -104,10 +99,6 @@ namespace HeadTrackARKit {
 		private float fovWeWrote_;
 		private bool hasGameBaseFov_;
 
-		// 0.5.3: tracks whether a custom camera matrix is currently applied, so the Reset* calls only
-		// run on the transition out of that state instead of every single frame - see
-		// ResetCameraOverrideIfApplied.
-		private bool cameraOverrideApplied_;
 
 		// 0.6.0: 0..1 ramp used to fade the tracked offset out on signal loss and back in on recovery,
 		// instead of snapping it off in a single frame. See the fade block in ApplyTrackingToCamera.
@@ -785,134 +776,57 @@ namespace HeadTrackARKit {
 
 			if (!config_.Enabled) {
 				// Make sure a previous frame's override doesn't linger once the mod is turned off.
-				ResetCameraOverrideIfApplied(cam);
+				ClearViewMatrixOverride(cam);
 			}
 		}
 
 		/// <summary>
-		/// 0.5.2 - FIXES THE DRIVING JITTER.
+		/// 0.7.0 - THE ARCHITECTURAL FIX. The camera's Transform is never written; only its view matrix.
 		///
-		/// The pose write is additive (<c>t.position += t.rotation * posOffset</c>), which silently
-		/// assumes something restores the camera to the game's own pose every rendered frame. That
-		/// assumption is false. Cinemachine's own metadata shows why: CinemachineBrain has
-		/// <c>m_UpdateMethod</c> (FixedUpdate / LateUpdate / <b>SmartUpdate</b> / ManualUpdate),
-		/// <c>m_BlendUpdateMethod</c>, and - decisively - <c>m_LastFrameUpdated</c> and
-		/// <c>mWaitForFixedUpdate</c> fields, alongside CinemachineCore.GetVcamUpdateStatus /
-		/// GetUpdateTarget. The Brain deliberately tracks which frame it last pushed a pose and skips
-		/// frames; under SmartUpdate a physics-tracked target is driven at the FIXED timestep, so at any
-		/// framerate above that timestep some rendered frames get no fresh Brain write at all.
+		/// Every defect in this project's history traces to one decision: writing <c>cam.transform</c>,
+		/// an object the game owns, rewrites every LateUpdate, and - critically - READS BACK.
+		/// From Assembly-CSharp, CarX.FollowCamera.LateUpdate does
+		/// <c>Transform::get_position</c> x3 -> <c>Vector3::Lerp</c> -> <c>get_forward</c> ->
+		/// <c>LookRotation</c> -> <c>set_rotation</c>, and CalcCameraPoint selects its tracking point by
+		/// <c>SqrMagnitude</c> distance FROM THE CAMERA'S POSITION, hard-resetting via
+		/// <c>Reset()</c>/<c>InstantApplyFocus()</c> when the winner flips. So the transform is an INPUT
+		/// to a stateful damper with discrete switching, not just an output.
 		///
-		/// On exactly those frames the old code added the offset on top of a transform that ALREADY
-		/// contained the previous frame's offset. The camera crept further out each un-refreshed frame,
-		/// the next Brain write snapped it back, and the cycle repeated - a back-and-forth shake that
-		/// only appears while driving, because that is when the physics/render rate mismatch and the
-		/// camera's own motion are both live. Latent since 0.3.8; invisible until 0.5.0 made the write
-		/// actually reach the screen.
+		/// 0.6.3 tried to contain that by reverting after render. That only narrows the window: the
+		/// transform is still polluted for the whole span between onBeforeRender and endCameraRendering
+		/// (which is when HDRP, custom passes, reflection probes, the StudioListener on this same
+		/// GameObject and LOD selection all read it), and if endCameraRendering is ever skipped for this
+		/// camera the offset leaks into the next LateUpdate and feeds the damper. Intermittent leakage
+		/// into a damper is, by definition, jitter.
 		///
-		/// The fix is to make the write idempotent. We remember both the pose the game handed us and the
-		/// pose we wrote. If the transform still reads back as our own pose, nobody refreshed it, so the
-		/// game's pose is restored before applying this frame's offset. When the game DOES refresh, the
-		/// new value is used as the base exactly as before - so genuine additive behaviour, and CarX's
-		/// sway and follow, are preserved.
+		/// Overriding <c>worldToCameraMatrix</c> instead removes the entire class of problem:
+		///   - the Transform stays exactly as CarX and Cinemachine left it, so nothing can feed back;
+		///   - no revert is needed, so there is no timing dependency to get wrong;
+		///   - HDRP honours it - the HDRP assembly references <c>Camera::get_worldToCameraMatrix</c> and
+		///     <c>get_cullingMatrix</c>, and <c>cullingMatrix</c> defaults to
+		///     <c>projectionMatrix * worldToCameraMatrix</c>, so culling follows automatically;
+		///   - <c>projectionMatrix</c> is deliberately NOT touched. HDRP's temporal AA applies its
+		///     sub-pixel jitter there, and clobbering it is what caused 0.3.19's "motion blur while
+		///     standing still" and shadow flicker. The view matrix carries no jitter state.
+		///
+		/// The scale of (1, 1, -1) is the standard Unity idiom: view space looks down -Z while a
+		/// Transform's forward is +Z, so the handedness flip belongs in the matrix, not the pose.
 		/// </summary>
-		private void RestoreGameBasePoseIfUnrefreshed(Transform t) {
-			if (!hasGameBasePose_) return;
-
-			// Tight epsilons: only treat this as "unrefreshed" when the transform is bit-near identical
-			// to what we wrote. Any real camera update by the game moves it far more than this.
-			bool positionUnchanged = (t.position - poseWeWrotePosition_).sqrMagnitude < 1e-10f;
-			bool rotationUnchanged = Quaternion.Angle(t.rotation, poseWeWroteRotation_) < 0.001f;
-
-			if (positionUnchanged && rotationUnchanged) {
-				t.position = gameBasePosition_;
-				t.rotation = gameBaseRotation_;
-				unrefreshedFrames_++;
-			}
+		private void ApplyViewMatrixOverride(Camera cam, Vector3 position, Quaternion rotation) {
+			cam.worldToCameraMatrix = Matrix4x4.TRS(position, rotation, new Vector3(1f, 1f, -1f)).inverse;
+			viewMatrixOverridden_ = true;
 		}
 
 		/// <summary>
-		/// 0.5.4: a steady frame to express the tracked translation in - see the call site for why the
-		/// camera's live rotation was the wrong choice.
-		///
-		/// Preference order:
-		///  1. The car's heading, yaw only. Smooth, and free of the camera's sway and drift-follow
-		///     swing, so a motionless phone yields a motionless offset no matter how hard the camera is
-		///     being thrown around.
-		///  2. The camera's own heading, yaw only, when there is no car (garage, menus, spectating).
-		///     Still strips pitch/roll sway; only the yaw component can move, and it moves smoothly.
-		///
-		/// Yaw-only in both cases: taking the full rotation would let camera pitch or roll tip a
-		/// sideways lean into a vertical one, which is the same class of bug 0.3.16 fixed for the
-		/// calibration frame.
+		/// Hands the view matrix back to Unity, which then derives it from the Transform as normal.
+		/// Only acts when an override is actually in place - calling ResetWorldToCameraMatrix every
+		/// frame regardless is the 0.5.3 defect.
 		/// </summary>
-		/// <summary>
-		/// 0.5.4: per-axis flip for the tracked translation. Rotation has had InvertPitch/InvertYaw
-		/// since 0.3.13, but translation had no equivalent, so a reversed left/right mapping (phone
-		/// left, camera right) could not be corrected from the settings panel at all. Applied after
-		/// GetPositionOffset, i.e. in the calibration-yaw frame, so X is straightforwardly
-		/// "left/right as you were facing when you pressed F9".
-		/// </summary>
-		private Vector3 ApplyPositionInvert(Vector3 offset) {
-			if (config_.InvertPositionX) offset.x = -offset.x;
-			if (config_.InvertPositionY) offset.y = -offset.y;
-			if (config_.InvertPositionZ) offset.z = -offset.z;
-			return offset;
-		}
-
-		private Quaternion GetStableOffsetFrame(Transform cameraTransform) {
-			return Quaternion.AngleAxis(GetSmoothedFrameYaw(cameraTransform), Vector3.up);
-		}
-
-		/// <summary>
-		/// 0.6.2: the offset frame's heading, low-passed.
-		///
-		/// 0.5.4 moved the offset frame onto the CAR's transform, which fixed the sway coupling but
-		/// introduced a new problem: the car is physics-driven, so its transform advances at the FIXED
-		/// timestep, not the render rate. Sampling <c>car.forward</c> once per rendered frame therefore
-		/// reads a staircase whenever the render rate is above the physics rate - the heading holds for
-		/// a frame or two, then jumps. Because the tracked offset is rotated by that frame, the offset
-		/// direction inherits the steps, and the camera advances unevenly. That is car-motion-dependent
-		/// by construction: parked, the heading is constant and there is nothing to step.
-		///
-		/// A live 0.6.1 capture is consistent with this - per-frame camera step size had a standard
-		/// deviation of 34% of its mean, and the step-size autocorrelation peaked at lag 2 (+0.325)
-		/// ABOVE lag 1 (+0.141), which is a two-frame periodic beat rather than smooth motion.
-		///
-		/// The frame only needs to answer "which way is left", so a few milliseconds of lag on it is
-		/// imperceptible, while low-passing removes the stepping regardless of whether the car's
-		/// Rigidbody has interpolation enabled.
-		/// </summary>
-		private float GetSmoothedFrameYaw(Transform cameraTransform) {
-			float targetYaw = GetRawFrameYaw(cameraTransform);
-
-			if (!hasFrameYaw_) {
-				frameYaw_ = targetYaw;
-				hasFrameYaw_ = true;
-				return frameYaw_;
-			}
-
-			// Frame-rate independent exponential smoothing, through the shortest arc so it behaves
-			// correctly across the +-180 seam.
-			float rate = 1f - Mathf.Exp(-Time.unscaledDeltaTime / Mathf.Max(0.001f, FrameYawTimeConstant));
-			frameYaw_ += Mathf.DeltaAngle(frameYaw_, targetYaw) * rate;
-			return frameYaw_;
-		}
-
-		private float GetRawFrameYaw(Transform cameraTransform) {
-			Transform car = GetCarTransform();
-
-			Vector3 forward = car != null ? car.forward : cameraTransform.forward;
-
-			// Flatten to the horizontal plane. Degenerate only if looking exactly straight up or down,
-			// in which case fall back to the transform's own flattened right vector for a stable basis.
-			Vector3 flat = new Vector3(forward.x, 0f, forward.z);
-			if (flat.sqrMagnitude < 1e-6f) {
-				Vector3 right = car != null ? car.right : cameraTransform.right;
-				flat = new Vector3(right.z, 0f, -right.x);
-				if (flat.sqrMagnitude < 1e-6f) return hasFrameYaw_ ? frameYaw_ : 0f;
-			}
-
-			return Mathf.Atan2(flat.x, flat.z) * Mathf.Rad2Deg;
+		private void ClearViewMatrixOverride(Camera cam) {
+			if (!viewMatrixOverridden_) return;
+			cam.ResetWorldToCameraMatrix();
+			cam.ResetCullingMatrix();
+			viewMatrixOverridden_ = false;
 		}
 
 		private void ApplyTrackingToCamera(Camera cam) {
@@ -993,7 +907,7 @@ namespace HeadTrackARKit {
 			signalConfidence_ = Mathf.Clamp01(signalConfidence_ + (signalStale ? -fadeStep : fadeStep));
 
 			if (state_.IsCalibrated && signalConfidence_ <= 0f) {
-				ResetCameraOverrideIfApplied(cam);
+				ClearViewMatrixOverride(cam);
 				return;
 			}
 
@@ -1006,16 +920,10 @@ namespace HeadTrackARKit {
 					FixLookDirection(state_.GetRotationOffsetEuler()),
 					signalConfidence_);
 
+				// 0.7.0: the Transform is READ ONLY from here on. See ApplyViewMatrixOverride.
 				Transform t = cam.transform;
-
-				// 0.5.2: undo our own previous offset if the game didn't refresh the camera this frame,
-				// so the additive write can never compound. See RestoreGameBasePoseIfUnrefreshed.
-				RestoreGameBasePoseIfUnrefreshed(t);
-
-				// Whatever the game's pose is right now becomes this frame's base.
-				gameBasePosition_ = t.position;
-				gameBaseRotation_ = t.rotation;
-				hasGameBasePose_ = true;
+				Vector3 finalPosition = t.position;
+				Quaternion finalRotation = t.rotation;
 
 				// 0.4.0: the car-anchored rig - see the big comment on the anchor fields for why this
 				// replaces the old additive write. Both branches below produce a final pose; the rig
@@ -1114,14 +1022,14 @@ namespace HeadTrackARKit {
 						? Quaternion.FromToRotation(oldAim, newAim)
 						: Quaternion.identity;
 
-					t.position = newPosition;
+					finalPosition = newPosition;
 
 					// 0.5.5: same stable-axis treatment as the non-orbit path - `* rotOffset` on the end
 					// would apply the phone delta about the camera's own tilting axes and reintroduce the
 					// sway-coupled wobble here. aimCorrection stays a world-space pre-multiply.
 					Quaternion orbitStable = GetStableOffsetFrame(t);
 					Quaternion orbitStableDelta = orbitStable * rotOffset * Quaternion.Inverse(orbitStable);
-					t.rotation = orbitStableDelta * aimCorrection * t.rotation;
+					finalRotation = orbitStableDelta * aimCorrection * t.rotation;
 				}
 				else {
 					// 0.5.4 - FIXES THE DRIVING/DRIFTING SHAKE.
@@ -1149,7 +1057,7 @@ namespace HeadTrackARKit {
 
 					lastAppliedPosOffset_ = posOffset;
 
-					t.position += offsetFrame * posOffset;
+					finalPosition = t.position + offsetFrame * posOffset;
 
 					// 0.5.5 - THE REMAINING SHAKE. Same bug as the translation frame (0.5.4), left in
 					// place for rotation.
@@ -1174,111 +1082,32 @@ namespace HeadTrackARKit {
 					// or swinging. The contribution is then constant for a constant phone pose, which is
 					// the property that removes the shake.
 					Quaternion stableDelta = offsetFrame * rotOffset * Quaternion.Inverse(offsetFrame);
-					t.rotation = stableDelta * t.rotation;
+					finalRotation = stableDelta * t.rotation;
 				}
 
-				// 0.3.17: ground-truth check for the "stepping left does nothing" report - logs
-				// the camera's ACTUAL world position right after this mod wrote to it, so a test
-				// log shows directly whether the Transform write itself is taking effect, as
-				// opposed to something else (e.g. CarX/Kino's own follow-cam logic) overwriting it
-				// again before the frame actually renders.
-				lastCameraWorldPosAfterWrite_ = t.position;
+				// 0.7.0: the ONLY place the camera is affected - a view-matrix override. The Transform
+				// still holds exactly what CarX and Cinemachine put there.
+				ApplyViewMatrixOverride(cam, finalPosition, finalRotation);
 
-				// 0.5.0: recorded so OnEndCameraRendering can do a real overwrite check - see there.
-				poseWrittenPosition_ = t.position;
+				lastCameraWorldPosAfterWrite_ = finalPosition;
+				poseWrittenPosition_ = finalPosition;
 				poseWrittenThisFrame_ = true;
-
-				// 0.5.2: what we wrote, so next frame can tell whether the game refreshed the camera or
-				// left our value in place. See RestoreGameBasePoseIfUnrefreshed.
-				poseWeWrotePosition_ = t.position;
-				poseWeWroteRotation_ = t.rotation;
-
-				// 0.6.3: mark for the post-render revert in OnEndCameraRendering.
-				poseAppliedCamera_ = cam;
-				poseAppliedThisFrame_ = true;
+			}
+			else {
+				ClearViewMatrixOverride(cam);
 			}
 
-			// 0.3.19 root-caused, 0.3.22 patched with hysteresis, 0.3.25 fixes properly: the
-			// custom matrix override (ApplyCameraOverride) only exists to win against Kino's own
-			// Custom Camera system possibly re-freezing the render matrix in Photo Mode - see
-			// ApplyCameraOverride's doc comment. Manually reassigning
-			// worldToCameraMatrix/projectionMatrix disables the render pipeline's per-frame TAA
-			// jitter and temporal motion-vector bookkeeping (the "crazy motion blur while
-			// standing still" report) and can break cascaded shadow culling (the "shadows
-			// disappear/flicker" reports) - so it should only ever run where it's actually needed.
-			//
-			// Every version through 0.3.24 decided this per-frame based on offset magnitude
-			// (hasZoom||hasPoseOffset), which meant natural hand jitter crossing the epsilon
-			// threshold flipped the override on and off many times a second outside Photo Mode
-			// too - that flipping was the flicker, not the override itself. The real distinction
-			// was never "is there an offset," it's "are we in Photo Mode" - outside Photo Mode,
-			// plain Transform writes (above) already fully win each frame just by running last
-			// (see the LateUpdate resubscribe comment), proven by the endOfRender diagnostics: no
-			// custom matrix needed there at all, so shadows/TAA/motion blur stay exactly as Unity
-			// intends. Only Kino's Photo Mode camera has ever been suspected of reasserting a
-			// matrix independent of the Transform, so the override is now scoped to Photo Mode
-			// only, unconditionally while calibrated or zoomed - no hysteresis, no per-frame
-			// magnitude judgment call, no flicker.
-			if ((hasZoom || state_.IsCalibrated) && IsInPhotoMode()) {
-				ApplyCameraOverride(cam);
-				cameraOverrideApplied_ = true;
-			} else {
-				// 0.5.3: gated - see ResetCameraOverrideIfApplied. Calling the Reset* trio every frame
-				// was discarding HDRP's per-frame TAA jitter and destabilising temporal reprojection.
-				ResetCameraOverrideIfApplied(cam);
-			}
+			// 0.7.0: the Photo-Mode-only projection/view override is gone. It existed to win against
+			// Kino's custom camera possibly reasserting a matrix, but we now set worldToCameraMatrix
+			// unconditionally every frame in onBeforeRender - before HDRP reads it - which wins by
+			// construction, and we never touch projectionMatrix so TAA jitter is preserved everywhere.
 		}
 
-		/// <summary>
-		/// Rebuilds and reassigns Camera.worldToCameraMatrix, Camera.projectionMatrix, and the
-		/// matching cullingMatrix from the camera's current Transform/fieldOfView. See the comment
-		/// at the call site in <see cref="OnCameraPreCull"/> for why both matrices need to be set
-		/// explicitly rather than relying on Unity to derive them normally.
-		/// </summary>
-		private static void ApplyCameraOverride(Camera cam) {
-			Matrix4x4 view = cam.transform.worldToLocalMatrix;
-			// Unity's camera space looks down local -Z, while a plain worldToLocalMatrix follows
-			// the transform's own +Z-forward convention - flipping the Z row is the standard way
-			// to reconcile the two when building a view matrix manually.
-			view.SetRow(2, -view.GetRow(2));
+		// 0.7.0: ApplyCameraOverride / ResetCameraOverride / ResetCameraOverrideIfApplied removed.
+		// They set projectionMatrix as well as the view matrix, which is what broke HDRP's TAA jitter
+		// and shadow culling (0.3.19), and the unconditional reset was itself a per-frame defect
+		// (0.5.3). ApplyViewMatrixOverride replaces all three and never touches the projection.
 
-			Matrix4x4 proj = Matrix4x4.Perspective(cam.fieldOfView, cam.aspect, cam.nearClipPlane, cam.farClipPlane);
-
-			cam.worldToCameraMatrix = view;
-			cam.projectionMatrix = proj;
-			cam.cullingMatrix = proj * view;
-		}
-
-		/// <summary>Reverts a camera to the game's own default view/projection/culling behavior.</summary>
-		private static void ResetCameraOverride(Camera cam) {
-			cam.ResetWorldToCameraMatrix();
-			cam.ResetProjectionMatrix();
-			cam.ResetCullingMatrix();
-		}
-
-		/// <summary>
-		/// 0.5.3: only reset the camera matrices when we actually have an override applied.
-		///
-		/// This mod's own history (0.3.19) established that touching
-		/// worldToCameraMatrix/projectionMatrix interferes with the render pipeline's per-frame TAA
-		/// jitter and temporal motion-vector bookkeeping - that is what produced the original "crazy
-		/// motion blur while standing still" and "shadows flicker" reports. The override itself was
-		/// then correctly scoped to Photo Mode only... but the matching <see cref="ResetCameraOverride"/>
-		/// was left running unconditionally on EVERY frame, and it touches exactly the same three
-		/// matrices. ResetProjectionMatrix in particular discards HDRP's sub-pixel TAA jitter for that
-		/// frame; doing it every frame gives the temporal filter an inconsistent projection history,
-		/// which shows up as shimmer/jitter and is most visible while the view is moving - i.e. while
-		/// driving. Now that the write happens in onBeforeRender (0.5.0), this lands right before HDRP
-		/// sets up the frame, so the interference is direct.
-		///
-		/// Resetting a camera that was never overridden is a no-op in intent but not in effect, so it
-		/// is simply not done any more.
-		/// </summary>
-		private void ResetCameraOverrideIfApplied(Camera cam) {
-			if (!cameraOverrideApplied_) return;
-			ResetCameraOverride(cam);
-			cameraOverrideApplied_ = false;
-		}
 
 		/// <summary>
 		/// SRP (URP/HDRP) equivalent of <see cref="OnCameraPreCull"/> - see the comment on the
@@ -1331,24 +1160,8 @@ namespace HeadTrackARKit {
 				}
 			}
 
-			// 0.6.3 - undo our offset now that the frame is drawn.
-			//
-			// CarX's chase camera is a STATEFUL DAMPED FOLLOW that reads the camera's live transform as
-			// its own input. From Assembly-CSharp, CarX.FollowCamera.LateUpdate calls:
-			//     Transform::get_position (x3), Vector3::Lerp,
-			//     Transform::get_forward -> Quaternion::LookRotation -> Transform::set_rotation,
-			//     Transform::Rotate, Mathf::MoveTowards
-			// and CalcCameraPoint picks its tracking point by SqrMagnitude distance FROM THE CAMERA'S
-			// POSITION, hard-resetting via Reset()/InstantApplyFocus() when the choice flips. Leaving
-			// our offset on the transform fed all of that back into itself. Reverting here means the
-			// rendered image keeps the offset while the game's camera logic never observes it.
-			if (poseAppliedThisFrame_ && ReferenceEquals(cam, poseAppliedCamera_)) {
-				Transform t = cam.transform;
-				t.position = gameBasePosition_;
-				t.rotation = gameBaseRotation_;
-				if (hasGameBaseFov_) cam.fieldOfView = gameBaseFov_;
-				poseAppliedThisFrame_ = false;
-			}
+			// 0.6.3's post-render revert is GONE as of 0.7.0 - there is nothing to revert, because the
+			// Transform is never written. See ApplyViewMatrixOverride.
 
 			// 0.6.4 - PER-FRAME LOGGING REMOVED FROM THE HOT PATH.
 			//
@@ -1513,8 +1326,8 @@ namespace HeadTrackARKit {
 				// skipping frames (SmartUpdate on a physics-tracked target), which is what used to make
 				// the additive write compound into a shake. Now it just means the base was restored.
 				Kino.Log.Info(
-					$"[HeadTrackARKit][diag] unrefreshedFrames={unrefreshedFrames_} " +
-					$"posSmoothing={config_.PositionSmoothing:F2} rotSmoothing={config_.RotationSmoothing:F2}");
+					$"[HeadTrackARKit][diag] viewMatrixOverride={viewMatrixOverridden_} " +
+					$"filterMinCutoff={config_.FilterMinCutoffHz:F2}Hz filterSpeedCoef={config_.FilterSpeedCoefficient:F3}");
 				// 0.4.0: which camera mode is actually in effect. "rig" means the car-anchored
 				// reconstruction is driving the camera; "additive-fallback" means no car could be
 				// resolved so the old behaviour is in play. If this ever reads additive-fallback

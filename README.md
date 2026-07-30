@@ -9,6 +9,72 @@ mod other than "phone streams ARKit data over OSC" being the same general idea).
 
 ## Changelog
 
+**0.7.0** - **Architectural fix. The camera's Transform is never written; only its view matrix.**
+
+### The common cause behind every jitter bug in this project
+
+Every defect in the log traces to one decision: writing `cam.transform`. That Transform is not an
+output the mod owns — it is an **input to the game's own camera system**:
+
+| Reader | What it does with it |
+|---|---|
+| `CarX.FollowCamera.LateUpdate` | `get_position` ×3 → `Vector3::Lerp` → `get_forward` → `LookRotation` → `set_rotation`. A **stateful damper** whose input is the live transform. |
+| `CarX.FollowCamera.CalcCameraPoint` | Picks its tracking point by `SqrMagnitude` distance **from the camera's position**, then `Reset()` + `InstantApplyFocus()` — a **hard snap** when the winner flips. |
+| `CinemachineBrain` | Rewrites it every `LateUpdate`; `m_UpdateMethod` may skip frames. |
+| `StudioListener` (same GameObject), LOD, reflection probes, HDRP | All read it mid-frame. |
+
+0.6.3 tried to contain this by reverting after render. That only narrows the window — the transform is
+still polluted for the whole span between `onBeforeRender` and `endCameraRendering`, and if
+`endCameraRendering` is skipped for that camera on any frame, the offset leaks into the next
+`LateUpdate` and feeds the damper. **Intermittent leakage into a stateful damper is, by definition,
+jitter** — and only while that damper is doing work, i.e. while the car moves.
+
+### The fix
+
+Override `Camera.worldToCameraMatrix` instead. The Transform is now strictly **read-only**:
+
+```csharp
+cam.worldToCameraMatrix = Matrix4x4.TRS(position, rotation, new Vector3(1f, 1f, -1f)).inverse;
+```
+
+- The Transform stays exactly as CarX and Cinemachine left it → **nothing can feed back**.
+- **No revert is needed**, so there is no timing dependency left to get wrong.
+- HDRP honours it — the HDRP assembly references `Camera::get_worldToCameraMatrix` and
+  `get_cullingMatrix`, and `cullingMatrix` defaults to `projectionMatrix * worldToCameraMatrix`, so
+  culling follows automatically.
+- **`projectionMatrix` is deliberately never touched.** HDRP's temporal AA applies its sub-pixel jitter
+  there — clobbering it is what caused 0.3.19's "motion blur while standing still" and shadow flicker.
+  The view matrix carries no jitter state.
+
+### Subsystems removed
+
+| Removed | Why it existed | Why it's now unnecessary |
+|---|---|---|
+| `RestoreGameBasePoseIfUnrefreshed` + `gameBase*`/`poseWeWrote*`/`unrefreshedFrames_` | Stop the additive Transform write compounding on skipped frames (0.5.2) | Nothing writes the Transform |
+| Post-render revert (0.6.3) | Keep the offset out of the game's damper | The damper never sees it at all |
+| `ApplyCameraOverride` / `ResetCameraOverride` / `ResetCameraOverrideIfApplied` | Win against Photo Mode reasserting a matrix | One unconditional view-matrix override wins by construction — and these also set `projectionMatrix`, the 0.3.19 defect |
+
+Net: the mod now has **exactly one** point of contact with the camera.
+
+### Verification (`tools/view_matrix_proof.py`)
+
+The design rests entirely on this matrix being what Unity would derive from a Transform at the offset
+pose, so it is checked against Unity's definition rather than assumed:
+
+| Check | Max error |
+|---|---|
+| Camera position → view-space origin | 1.4e-14 |
+| Point 10 m ahead → view-space (0, 0, −10) | 1.4e-14 |
+| Rigid — no scale, mirror or skew | 1.9e-14 |
+| A 13.3 cm pose offset shifts the view by exactly 13.3 cm | exact |
+
+**13 harnesses, 49 checks, all passing.**
+
+**Honest status:** this removes the mechanism, rather than tuning around it. The jitter cause is
+identified structurally (transform-as-damper-input) and proven present in CarX's IL; what has not been
+possible is measuring the visible shake directly, because it lives in `FollowCamera`'s discrete
+switching which cannot be faithfully simulated without the real tracking-point layout.
+
 **0.6.4** - Per-frame disk logging removed from the render hot path, and a self-triggering diagnostic
 fixed. Both found by reading the log the user just produced.
 

@@ -4,8 +4,8 @@
 **Game:** CarX Drift Racing Online (Unity, **HDRP**, Cinemachine-driven cameras)
 **Phone side:** LOTA (LiDAR Over the Air) streaming ARKit camera pose over OSC/UDP port 9000
 **Author:** Chaoz2
-**Versions covered in this log:** 0.3.21 → 0.4.6
-**Date of this session:** 2026-07-28 → 2026-07-29
+**Versions covered in this log:** 0.3.21 → 0.6.4
+**Date of this session:** 2026-07-28 → 2026-07-30
 
 ---
 
@@ -13,8 +13,16 @@
 
 > "The camera is not moving."
 
-Every single exchange below is a variation of that. It took **21 versions** across this log to get to
-a root cause I could demonstrate with measured evidence rather than assert.
+That was solved in **0.5.0** — the pose was being written *after* HDRP had already snapshotted the view
+matrix, so it never reached a rendered pixel in any version. Diagnosed from the game's own compiled
+HDRP assembly.
+
+It was then replaced by a second complaint:
+
+> "The camera jitters and shakes when the car moves."
+
+which took a further ten versions, because several genuinely different defects produced the same
+symptom. The decisive clue was the user's own observation that it was steady when parked.
 
 ---
 
@@ -255,6 +263,115 @@ turn at 2x still moves the camera 1.31 m.
 | 0.4.4 | **Fixed** the 0.4.0 weld — additive write restored |
 | 0.4.5 | Auto-rebind could never fire on a dead receiver; stop applying a stale frozen pose |
 | 0.4.6 | **Fixed** the 0.4.3 overshoot — orbit arc clamps + height floor + 2x default |
+| 0.5.0 | **THE root cause of "camera doesn't move"** — pose written after HDRP snapshots the view matrix |
+| 0.5.1 | Camera holds position and turns (orbit off, 1:1 translation) |
+| 0.5.2 | Additive write compounded on skipped frames; smoothing was packet-rate dependent |
+| 0.5.3 | Stop resetting camera matrices every frame (TAA); fix FOV write compounding |
+| 0.5.4 | Translation expressed in the car's heading (drift shake); translation invert options |
+| 0.5.5 | Rotation applied about stable axes (was camera-local post-multiply) |
+| 0.6.0 | Adaptive 1-euro jitter filter; fade offset on signal loss (teleport fix); log precision |
+| 0.6.1 | **atan2 yaw singularity** — direction-dependent shake; filter the 1-euro derivative |
+| 0.6.2 | Low-pass the offset-frame heading (physics staircase); filter retuned to 0.4 Hz |
+| 0.6.3 | **Revert camera after render** — CarX's damper was re-reading our offset |
+| 0.6.4 | Per-frame disk logging off the render hot path; fix self-triggering overwrite warning |
+
+---
+
+## Part 3 — "The camera doesn't move" is solved (0.5.0), then the jitter hunt
+
+### 0.5.0 — the actual root cause, from the game's own compiled HDRP
+
+Disassembled `Unity.RenderPipelines.HighDefinition.Runtime.dll`.
+`HDRenderPipeline.PrepareAndCullCamera` calls, in order:
+
+```
+IL_A5441   TryCalculateFrameParameters
+              IL_A74AF   HDCamera::GetOrCreate
+              IL_A74E7   HDCamera::Update              <-- view matrix captured HERE
+              IL_A7567   Camera::TryGetCullingParameters
+IL_A5568   TryCull                                     (calls BeginCameraRendering @ IL_A7963)
+IL_A55BF   BeginCameraRendering                        <-- our write hook, since 0.3.4
+```
+
+**Both** `BeginCameraRendering` call sites are reached *after* the view matrix is captured. So the pose
+write never affected a single rendered pixel, in any version. The frame drew from CarX's pose, then
+`CinemachineBrain.LateUpdate` overwrote our value.
+
+**Why every diagnostic disagreed:** `endOfRender` compared `transform.position` against
+`worldToCameraMatrix` — which Unity *derives from that same Transform on demand*. Circular. It could
+only ever confirm our own assignment landed, never that HDRP used it.
+
+**Fix:** write in `Application.onBeforeRender` — after every `LateUpdate` (so after the Brain), before
+the pipeline runs (so before `HDCamera.Update`). Works for every camera mode without special-casing,
+because they all resolve to a Transform by end of `LateUpdate`.
+
+**User: "CAMERA IS MOVING NOW."**
+
+### The jitter hunt (0.5.1 → 0.6.4)
+
+Once the camera moved, a shake appeared while driving. Each version below fixed something real; the
+symptom persisted until 0.6.3/0.6.4.
+
+| Version | Found | Verdict |
+|---|---|---|
+| 0.5.2 | Additive write compounded on frames Cinemachine skipped | Real, but `unrefreshedFrames=0` later proved it wasn't firing |
+| 0.5.3 | `ResetCameraOverride` ran every frame, discarding HDRP's TAA jitter | Real |
+| 0.5.4 | Translation used the camera's **live** rotation (sway/drift swing) → 5.71 cm wobble | Real, fixed |
+| 0.5.5 | Rotation used camera-local post-multiply → 1.89° oscillating aim error | Real, fixed |
+| 0.6.0 | `RotationSmoothing=0.83` ≈ unfiltered; added 1-euro filter | Real |
+| 0.6.1 | **atan2 yaw singularity** — 0.91° jitter horizontal vs **53.76°** at 89° pitch | Real, 59× fixed |
+| 0.6.2 | Offset frame sampled the physics-driven `car.forward` → staircase | Real but **0.13 mm** |
+| 0.6.3 | **CarX's damper re-read our offset** → 3× amplification | Real, likely the shake |
+| 0.6.4 | **~144 synchronous disk writes/sec** on the render thread | Real perf defect |
+
+### 0.6.1 — the direction-dependent shake
+
+`yaw = Atan2(fwd.x, fwd.z)` is singular as forward approaches vertical — both components collapse, so
+noise decides the result. Same input noise:
+
+| Phone pitch | Yaw jitter |
+|---|---|
+| 0° | 0.265° |
+| 60° | 0.529° |
+| 85° | 3.037° |
+| **89°** | **15.485°** |
+
+Fixed by weighting the yaw update by `horizontalLen` — which *is* the confidence, and cancels the
+`1/horizontalLen` amplification exactly. Result: **1.0× across all directions**, 59× better worst case.
+
+### 0.6.3 — the feedback loop
+
+The decisive clue was the user's own observation: **"doesn't shake when the car is not moving."** That
+rules out phone noise, filter tuning and the singularity — all of which would shake parked too.
+
+From `Assembly-CSharp`, `CarX.FollowCamera.LateUpdate`:
+
+```
+Transform::get_position  (x3)     <- reads where the camera currently IS
+Vector3::Lerp                     <- damps from that toward its target
+Transform::get_forward -> Quaternion::LookRotation -> Transform::set_rotation
+Transform::Rotate, Mathf::MoveTowards
+```
+
+and `CalcCameraPoint` picks its tracking point by `SqrMagnitude` distance **from the camera's position**,
+hard-resetting via `Reset()` / `InstantApplyFocus()` when the choice flips.
+
+Leaving our offset on the transform fed all of that back into itself — modelled at **3× amplification**
+(30 cm requested → 90 cm displacement). Fixed by reverting the camera to the game's pose in
+`OnEndCameraRendering`: the rendered image keeps the offset, the game never observes it. Standard
+late-latch.
+
+### 0.6.4 — what the user's last log revealed
+
+| | |
+|---|---|
+| PhoneCam lines | **7,252 — 84% of the entire game log** |
+| `endOfRender` (one per frame per camera) | 3,307 |
+| `OVERWRITTEN` warnings | **2,923 — all self-inflicted** |
+
+The 0.6.3 revert had been placed *before* the 0.5.0 drift check, so the check measured our own revert.
+And `endOfRender` had been logging every frame since 0.3.21 — ~144 synchronous disk writes/second on the
+render thread. Both fixed; verbose logging is now opt-in and rate-limited.
 
 ---
 
@@ -272,6 +389,25 @@ turn at 2x still moves the camera 1.31 m.
    explicit matrix override is set; it never proved what was on screen.
 5. **0.3.31 dead-receiver bug** — wrote auto-recovery that was unreachable in the only state it
    existed to handle.
+6. **The circular diagnostic (0.3.21 → 0.5.0)** — the single most costly error. `endOfRender` compared
+   `transform.position` against `worldToCameraMatrix`, which Unity derives *from that Transform*. It
+   agreed trivially every time, and I reported those agreements as proof the camera was moving for
+   ~20 versions while the user's screen showed nothing.
+7. **Logging in whole degrees** — `appliedOffsetEuler` used `F0`, `transformPos`/`Fwd` used `F2`. Every
+   jitter measurement before 0.6.0 sat at or below that quantisation floor; 79% of consecutive
+   `endOfRender` lines were byte-identical. The "6.4% reversals" that motivated 0.5.5 was largely
+   quantisation noise.
+8. **My own 1-euro filter was wrong (0.6.0)** — fed the raw derivative into the adaptive cutoff, so
+   noise inflated the speed estimate, which opened the cutoff, which passed more noise. The canonical
+   filter low-passes the derivative first; I'd omitted it.
+9. **0.6.3 revert placed before its own check** — produced 2,923 false `OVERWRITTEN` warnings, one per
+   frame, in the very next log.
+10. **Per-frame disk logging left in since 0.3.21** — ~144 synchronous writes/second on the render
+    thread, shipped for 30+ versions.
+11. **Three wrong metrics, caught and corrected** — total path length and total jerk both looked "fine"
+    because they are dominated by the car's own smooth motion; absolute camera aim included CarX's
+    legitimate sway and showed ~17° in *both* modes. Only the car-relative / contributed-delta framings
+    isolated the artefact. Recorded in the scripts rather than quietly re-thresholded.
 
 ---
 
@@ -300,6 +436,22 @@ run in-game.
 
 | Script | Checks | Status |
 |---|---|---|
+| `frame_order_proof.py` | 3 — reproduces the HDRP snapshot-before-write bug and its fix; mode independence | 3/3 |
+| `rig_validation.py` | 9 — car following, 1:1 translation/rotation, no drift, orbit travel, framing | 9/9 |
+| `regression_proof.py` | 3 — the 0.4.0 weld and its removal; neutral-pose no-op | 3/3 |
+| `orbit_clamp_proof.py` | 3 — under-car elimination on real logged values; exhaustive angle sweep | 3/3 |
+| `jitter_proof.py` | 4 — pose accumulation, packet-rate smoothing, frame-rate independence, FOV pumping | 4/4 |
+| `offset_frame_proof.py` | 3 — 5.71 cm drift wobble reproduced and removed | 3/3 |
+| `rotation_frame_proof.py` | 3 — 1.89° contributed-aim wobble reproduced and removed | 3/3 |
+| `adaptive_filter_proof.py` | 3 — 1-euro vs fixed low-pass; the trade-off a fixed filter can't escape | 3/3 |
+| `derivative_filter_proof.py` | 4 — the filter's own noise-feedback loop (partial fix, stated as such) | 4/4 |
+| `yaw_singularity_proof.py` | 4 — 58.5× direction dependence → 1.0× | 4/4 |
+| `frame_staircase_proof.py` | 3 — physics-rate staircase (137% variation, 65% frozen frames) | 3/3 |
+| `feedback_loop_proof.py` | 3 — CarX's damper re-reading our offset, 3× amplification | 3/3 |
+
+**12 harnesses, 45 checks, all passing.** They validate the *algorithms*, not the compiled binary.
+
+---|---|---|
 | `rig_validation.py` | 9 — car following, 1:1 translation/rotation, no drift, stability, orbit travel, framing, car-locality | 9/9 |
 | `regression_proof.py` | 3 — reproduces the 0.4.0 weld and its removal; neutral-pose no-op; travel when moved | 3/3 |
 | `orbit_clamp_proof.py` | 3 — under-car elimination on real logged values, exhaustive angle sweep, usable travel at 2x | 3/3 |
@@ -321,14 +473,29 @@ Release builds are signed into `PhoneCam.ksm` by `tools/maykr.exe` using
 
 ---
 
+## Current state
+
+**Working:** the camera moves with the phone, in every camera mode, since 0.5.0. Confirmed by the user.
+
+**Outstanding:** jitter while driving. 0.6.3 (feedback loop) and 0.6.4 (per-frame disk logging) are the
+two most recent candidates and were **not yet tested in-game** at the time of writing.
+
 ## Open items
 
-- **0.4.6 is unverified in-game.** Its geometry is proven; whether the on-screen result is now usable
-  is not yet known.
+- **0.6.3 / 0.6.4 unverified in-game.** 0.6.3's amplification result is proven in simulation; its
+  *jitter* mechanism rests on IL evidence (`CalcCameraPoint`'s distance comparison and hard reset) which
+  could not be faithfully simulated. 0.6.4's frame-spike mechanism is inferred from the write rate, not
+  measured directly.
+- **If jitter persists with verbose logging off**, the remaining untested suspects are HDRP TAA history
+  rejection (our sub-degree per-frame camera change vs the temporal filter) and `Mathf.MoveTowards` /
+  `LookRotation` nonlinearities inside `FollowCamera` that a linear model can't capture. Measuring
+  actual frame times would be the next instrument, not another code change.
 - **Positional tracking is weak, not absent** (`positionalSignalRange` widest ≈ 0.27 m). Worth checking
   LOTA has iOS **Camera permission** — ARKit cannot do positional world tracking without the camera
   feed and silently degrades toward attitude-only.
-- **Cockpit view + orbit** is untested. With a short boom the pivot sits close to the camera, so the
-  arc clamps behave differently than in chase cam; cockpit may want orbit off.
-- The `Enabled` toggle has ended three separate sessions switched off. `INERT` logging and the
-  `DISABLED` HUD line now make that state obvious.
+- **Cockpit view** is untested since the 0.5.x/0.6.x rework. With a short boom the orbit pivot sits close
+  to the camera, so the arc clamps behave differently than in chase cam.
+- **Offset strength changed in 0.6.3.** Removing the 3× feedback amplification means movement is roughly
+  a third as strong as it felt before. That is it being correct; `PositionSensitivity` is the dial.
+- The `Enabled` toggle ended three separate sessions switched off. `INERT` logging and the `DISABLED`
+  HUD line now make that state obvious.
